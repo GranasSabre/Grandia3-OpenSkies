@@ -62,6 +62,11 @@ static const char* const DE[26] = {"\xC3\xA4", "\xC3\xB6", "\xC3\xBC", "\xC3\x84
     "\xC3\xA0", "\xC3\xA2", "\xC3\xA7", "\xC3\xA9", "\xC3\xA8", "\xC3\xAA", "\xC3\xAB", "\xC3\xAE", "\xC3\xAF",
     "\xC3\xB4", "\xC3\xB9", "\xC3\xBB", "\xC3\x80", "\xC3\x87", "\xC3\x89", "\xC3\x88", "\xC3\x8A", "\xC3\x94",
     "\xC3\x82"};
+// Spanish (language "es"): the same slots, filled as in text_hook.cpp EXTRA_ES
+static const char* const ES[26] = {"\xC3\xA1", "\xC3\xB3", "\xC3\xBC", "\xC3\x81", "\xC3\x93", "\xC3\x9C", "\xC3\xB1",
+    "\xC3\xAD", "\xC3\xBA", "\xC3\x91", "\xC3\xA9", "\xC3\x8D", "\xC3\x9A", "\xC2\xA1", "\xC2\xBF", "\xC3\xAF",
+    "\xC3\xB4", "\xC3\xB9", "\xC3\xBB", "\xC3\x80", "\xC3\x87", "\xC3\x89", "\xC3\x88", "\xC3\x8A", "\xC3\x94",
+    "\xC3\x82"};
 // their Shift-JIS codes in the field menu: the menu font's character list (GR3.MDT) puts the glyphs
 // 0x98.. at ぅうぇえぉおか が ワヲヴヵヶゎヮぢヂ○♪＋−一二三■＿
 static const u16 FIELD_SJIS[26] = {0x82A3, 0x82A4, 0x82A5, 0x82A6, 0x82A7, 0x82A8, 0x82A9, 0x82AA,
@@ -99,8 +104,9 @@ static std::vector<u8> encode(const std::string& s, bool field, bool desc, bool 
         if (ch == ' ') { put(field ? 0x20 : 0x80); i++; continue; }
         if (ch < 0x80) { put(ch); i++; continue; }
         int k = -1;
+        static const char* const* letters = platform::config().language == "es" ? ES : DE;
         for (int j = 0; j < 26; j++)
-            if (s.compare(i, 2, DE[j]) == 0) k = j;
+            if (s.compare(i, 2, letters[j]) == 0) k = j;
         if (k >= 0) {
             if (field) { out.push_back((u8)(FIELD_SJIS[k] >> 8)); out.push_back((u8)FIELD_SJIS[k]); }
             else put(0xB8 + k);

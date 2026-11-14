@@ -35,7 +35,8 @@ static u32 g_slot = 0;
 
 // Extra letters: glyph slots (unused kana) and the letters they are made from. German 0x98..0x9E
 // (dots as before), French 0x9F..0xB1 (accent templates, see fr_glyphs.py for a preview).
-// accent: 'd' dots, 'a' acute, 'g' grave, 'c' circumflex, 'k' cedilla, 0 = ß
+// accent: 'd' dots, 'a' acute, 'g' grave, 'c' circumflex, 'k' cedilla, 't' tilde, 'r' the base
+// character turned by 180 degrees (¡ ¿), 0 = ß
 struct Extra { const char* utf8; u8 glyph; char base; bool upper; char accent; bool german; };
 static const Extra EXTRA[] = {
     {"\xC3\xA4", 0x98, 'a', false, 'd', true}, {"\xC3\xB6", 0x99, 'o', false, 'd', true}, {"\xC3\xBC", 0x9A, 'u', false, 'd', true},
@@ -49,17 +50,35 @@ static const Extra EXTRA[] = {
     {"\xC3\x88", 0xAE, 'E', true, 'g', false},  {"\xC3\x8A", 0xAF, 'E', true, 'c', false},  {"\xC3\x94", 0xB0, 'O', true, 'c', false},
     {"\xC3\x82", 0xB1, 'A', true, 'c', false},
 };
+// Spanish (language "es") reuses the slots of letters it does not need; é É ü Ü stay where they
+// are (preview: tools/es_glyphs.py; tools/letters.py EXTRA_ES has the same order)
+static const Extra EXTRA_ES[] = {
+    {"\xC3\xA1", 0x98, 'a', false, 'a', false}, {"\xC3\xB3", 0x99, 'o', false, 'a', false}, {"\xC3\xBC", 0x9A, 'u', false, 'd', true},
+    {"\xC3\x81", 0x9B, 'A', true, 'a', false},  {"\xC3\x93", 0x9C, 'O', true, 'a', false},  {"\xC3\x9C", 0x9D, 'U', true, 'd', true},
+    {"\xC3\xB1", 0x9E, 'n', false, 't', false}, {"\xC3\xAD", 0x9F, 'i', false, 'a', false}, {"\xC3\xBA", 0xA0, 'u', false, 'a', false},
+    {"\xC3\x91", 0xA1, 'N', true, 't', false},  {"\xC3\xA9", 0xA2, 'e', false, 'a', false}, {"\xC3\x8D", 0xA3, 'I', true, 'a', false},
+    {"\xC3\x9A", 0xA4, 'U', true, 'a', false},  {"\xC2\xA1", 0xA5, '!', false, 'r', false}, {"\xC2\xBF", 0xA6, '?', false, 'r', false},
+    {"\xC3\xAF", 0xA7, 'i', false, 'd', false}, {"\xC3\xB4", 0xA8, 'o', false, 'c', false}, {"\xC3\xB9", 0xA9, 'u', false, 'g', false},
+    {"\xC3\xBB", 0xAA, 'u', false, 'c', false}, {"\xC3\x80", 0xAB, 'A', true, 'g', false},  {"\xC3\x87", 0xAC, 'C', true, 'k', false},
+    {"\xC3\x89", 0xAD, 'E', true, 'a', false},  {"\xC3\x88", 0xAE, 'E', true, 'g', false},  {"\xC3\x8A", 0xAF, 'E', true, 'c', false},
+    {"\xC3\x94", 0xB0, 'O', true, 'c', false},  {"\xC3\x82", 0xB1, 'A', true, 'c', false},
+};
+// the letters of the game language (chosen when the translation is loaded)
+static const Extra* g_extra = EXTRA;
+static size_t g_nextra = sizeof(EXTRA) / sizeof(EXTRA[0]);
 
 // French accent templates: columns cx-2..cx+3 (cx = left of the two centre columns), '#' = ink
 static const char* accent_tpl(char accent, int kind, int row) {
-    static const char* LOW[4][3] = {{"...##.", "..##..", ".##..."}, {".##...", "..##..", "...##."},
-                                    {"..##..", ".####.", "##..##"}, {"##..##", "##..##", "......"}};
-    static const char* CAP[4][2] = {{"...##.", ".##..."}, {".##...", "...##."}, {"..##..", "##..##"}, {"##..##", "......"}};
-    static const char* NARROW[2][2] = {{".#.", "#.#"}, {"#.#", "..."}};  // over i: cx-1..cx+1
-    int a = accent == 'a' ? 0 : accent == 'g' ? 1 : accent == 'c' ? 2 : 3;
+    static const char* LOW[5][3] = {{"...##.", "..##..", ".##..."}, {".##...", "..##..", "...##."},
+                                    {"..##..", ".####.", "##..##"}, {"##..##", "##..##", "......"},
+                                    {"......", ".##..#", "#..##."}};
+    static const char* CAP[5][2] = {{"...##.", ".##..."}, {".##...", "...##."}, {"..##..", "##..##"}, {"##..##", "......"},
+                                    {".##..#", "#..##."}};
+    static const char* NARROW[3][2] = {{".#.", "#.#"}, {"#.#", "..."}, {"..#", ".#."}};  // over i: cx-1..cx+1
+    int a = accent == 'a' ? 0 : accent == 'g' ? 1 : accent == 'c' ? 2 : accent == 't' ? 4 : 3;
     if (kind == 0) return row < 3 ? LOW[a][row] : nullptr;
     if (kind == 1) return row < 2 ? CAP[a][row] : nullptr;
-    return row < 2 ? NARROW[a == 2 ? 0 : 1][row] : nullptr;
+    return row < 2 ? NARROW[a == 2 ? 0 : a == 0 ? 2 : 1][row] : nullptr;
 }
 
 // argument bytes of a control code inside message text (0E speaker/face, 13 FF pause, 12 style)
@@ -88,7 +107,8 @@ static std::vector<u8> encode(const std::string& s) {
         if (ch == ' ') { out.push_back(0xA0); i++; continue; }
         if (ch < 0x80) { out.push_back((u8)(ch + 0x20)); i++; continue; }
         bool done = false;
-        for (const Extra& e : EXTRA) {
+        for (size_t x = 0; x < g_nextra; x++) {
+            const Extra& e = g_extra[x];
             size_t n = strlen(e.utf8);
             if (s.compare(i, n, e.utf8) == 0) { out.push_back((u8)(e.glyph + 0x40)); i += n; done = true; break; }
         }
@@ -113,6 +133,10 @@ static void load() {
     g_loaded = true;
     // the game's own text is English: other languages come from lang\<code>.tsv
     std::string lang = platform::config().language;
+    if (lang == "es") {
+        g_extra = EXTRA_ES;
+        g_nextra = sizeof(EXTRA_ES) / sizeof(EXTRA_ES[0]);
+    }
     std::string path = exe_dir() + "\\lang\\" + lang + ".tsv";
     FILE* f = lang == "en" ? nullptr : fopen(path.c_str(), "rb");
     if (f) {
@@ -154,12 +178,35 @@ static const char* SZ[16] = {
     "00001f50002df100", "00001f50000af500", "00001f54007ff200", "00001f5effffa000", "0000085669830000",
     "0000000000000000"};
 
+static u8 g_patched[128];  // the first extra glyph as written (the game may reload its font)
+
 static void make_glyphs(u32 tbl) {
-    for (const Extra& e : EXTRA) {
+    for (size_t n = 0; n < g_nextra; n++) {
+        const Extra& e = g_extra[n];
         u8* dst = glyph_ptr(tbl, e.glyph);
         if (!dst) return;
         u8 tmp[128];
-        if (e.base && !e.german) {
+        if (e.accent == 'r') {
+            // ¡ ¿: the base sign turned by 180 degrees, in the same columns, its bottom one row
+            // below the original's bottom
+            const u8* src = glyph_ptr(tbl, e.base - 0x20);
+            int x0 = 16, x1 = -1, y1 = -1, b2 = -1;
+            for (int y = 0; y < 16; y++)
+                for (int x = 0; x < 16; x++)
+                    if (get(src, x, y) > 4) { x0 = std::min(x0, x); x1 = std::max(x1, x); y1 = std::max(y1, y); }
+            for (int y = 0; y < 16; y++)
+                for (int x = 0; x < 16; x++)
+                    if (get(src, 15 - x, 15 - y) > 4) b2 = std::max(b2, y);
+            int dx = x0 - (15 - x1), dy = (y1 + 1) - b2;
+            memset(tmp, 0, 128);
+            for (int y = 0; y < 16; y++)
+                for (int x = 0; x < 16; x++) {
+                    int v = get(src, 15 - x, 15 - y);
+                    if (v) put(tmp, x + dx, y + dy, v);
+                }
+            memcpy(dst, tmp, 128);
+            memcpy(width_ptr(tbl, e.glyph), width_ptr(tbl, e.base - 0x20), 2);
+        } else if (e.base && !e.german) {
             int bg = e.base - 0x20;
             memcpy(tmp, glyph_ptr(tbl, bg), 128);
             u8 wd[2];
@@ -169,11 +216,11 @@ static void make_glyphs(u32 tbl) {
                 for (int x = 0; x < 16; x++)
                     if (get(tmp, x, y) > 4) { top = std::min(top, y); x0 = std::min(x0, x); x1 = std::max(x1, x); }
             int cx = (x0 + x1) / 2, kind = 0, left = cx - 2, row0 = top - 4;
-            if (e.base == 'i') {  // no dot, two pixels wider for the accent
+            if (e.base == 'i') {  // no dot, two pixels wider for the accent (the acute leans right: one)
                 memset(tmp, 0, 5 * 8);
                 top = 5;
-                wd[0] = (u8)(wd[0] + 1);
-                wd[1] = (u8)(wd[1] + 2);
+                if (e.accent != 'a') wd[0] = (u8)(wd[0] + 1);
+                wd[1] = (u8)(wd[1] + (e.accent == 'a' ? 1 : 2));
                 kind = 2, left = cx - 1, row0 = top - 3;
             } else if (e.accent == 'k') {
                 left = cx - 2, row0 = 14;
@@ -239,6 +286,7 @@ static void make_glyphs(u32 tbl) {
             memcpy(width_ptr(tbl, e.glyph), width_ptr(tbl, 'B' - 0x20), 2);
         }
     }
+    if (const u8* g = glyph_ptr(tbl, g_extra[0].glyph)) memcpy(g_patched, g, 128);
 }
 
 // called every few vertical blanks: find the font in EE RAM (after it was loaded) and keep it patched
@@ -251,7 +299,8 @@ void font_tick() {
         u8* t = mem::ee_ptr(g_font_tbl);
         if (t && memcmp(t, sig, 16) == 0) {
             // still there: re-patch if the game reloaded it
-            if (width_ptr(g_font_tbl, 0x9E)[1] != width_ptr(g_font_tbl, 'B' - 0x20)[1]) make_glyphs(g_font_tbl);
+            const u8* g = glyph_ptr(g_font_tbl, g_extra[0].glyph);
+            if (g && memcmp(g, g_patched, 128) != 0) make_glyphs(g_font_tbl);
             return;
         }
         g_font_tbl = 0;
@@ -264,7 +313,7 @@ void font_tick() {
         if (p[0] == 0xfb && memcmp(p, sig, 16) == 0) {
             g_font_tbl = a;
             make_glyphs(a);
-            log_write(LOG_MAIN, "translation: font width table at %08x, German letters added", a);
+            log_write(LOG_MAIN, "translation: font width table at %08x, extra letters added (%s)", a, g_extra == EXTRA_ES ? "es" : "de/fr");
             return;
         }
     }
