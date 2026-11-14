@@ -333,7 +333,11 @@ static void process_words(VifState& v, const u32* w, u32 n) {
             // gather the whole unpack payload, then decode
             u32 total = unpack_words_for(cmd, (v.cmd >> 16) & 0xFF);
             std::vector<u32>& buf = g_upbuf[v.idx];
-            if (v.sub == 0) buf.assign(total + 4, 0);
+            if (v.sub == 0) {
+                // the payload overwrites [0, total); only the 4 spare words after it must be zero
+                if (buf.size() < total + 4) buf.resize(total + 4);
+                memset(&buf[total], 0, 16);
+            }
             u32 take = std::min(v.remaining, n - i);
             memcpy(&buf[v.sub], &w[i], take * 4);
             v.sub += take;

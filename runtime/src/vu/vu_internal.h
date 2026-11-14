@@ -6,6 +6,10 @@
 #include <immintrin.h>
 #include <cmath>
 
+#if defined(__aarch64__)
+#include "g3_vu_neon.h"  // Android: NEON versions of vsat / mac_of (runtime/android/include)
+#endif
+
 namespace vu {
 
 enum UOp : u8 {
@@ -125,6 +129,9 @@ static inline u32 latest_clip(VUState& v) { return v.clip_issued; }
 // results saturate to +-max.
 // ---------------------------------------------------------------------------
 static inline __m128 vsat(__m128 x) {
+#if defined(__aarch64__)
+    return (__m128)g3_vsat_u32((uint32x4_t)x);
+#endif
     const __m128i e = _mm_set1_epi32(0x7F800000);
     __m128i xi = _mm_castps_si128(x);
     __m128i sp = _mm_cmpeq_epi32(_mm_and_si128(xi, e), e);
@@ -144,6 +151,9 @@ static inline __m128 dest_mask(u32 dest) { return _mm_load_ps((const float*)g_la
 
 // MAC flags (zero bits 3..0, sign bits 7..4, x is the highest bit) of the written lanes
 static inline u32 mac_of(__m128 r, u32 dest) {
+#if defined(__aarch64__)
+    return g3_mac_of_u32((uint32x4_t)r, dest);
+#endif
     u32 lanes = g_rev4[dest];
     __m128i ri = _mm_castps_si128(r);
     __m128i z = _mm_cmpeq_epi32(_mm_and_si128(ri, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128());
@@ -166,5 +176,6 @@ void xgkick(VUState& v, u32 addr_qw);
 // it cannot handle the entry point (the interpreter then runs it).
 typedef bool (*AotFn)(VUState& v);
 int register_aot(u64 image_hash, AotFn fn);
+int register_aot_end_mac_free(u64 image_hash);
 
 }  // namespace vu

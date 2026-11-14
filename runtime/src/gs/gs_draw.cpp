@@ -50,6 +50,11 @@ static inline bool is_paletted(u32 psm) {
 
 static DrawState g_cur;  // decoded state of the current primitive (emulation thread)
 
+// Optional hooks for the software renderer (set by the Android platform: widescreen HUD correction,
+// android/hud_sw.cpp). The primitive hook may move the vertices and narrow the horizontal scissor.
+bool (*g_sw_prim_hook)(const DrawState& ds, int prim, const Vertex* v, Vertex* out, int* scax0, int* scax1) = nullptr;
+void (*g_sw_present_hook)(const PresentParams& p) = nullptr;
+
 // Decodes the draw state from the GS registers into g_cur. Returns true if it changed.
 static bool setup() {
     u64 m = (st.prmodecont & 1) ? st.prim : st.prmode;
@@ -793,6 +798,21 @@ static bool g_gpu_on = false;
 static bool g_gpu_compare = false;       // --gpu-compare: software composition of every frame for comparison
 static u64 g_gpu_busy_ticks = 0;
 static std::atomic<u64> g_write_seq{0};
+
+// Waking the consumers (renderer thread, rasterizer workers) only when one of them sleeps in
+// seq_wait: notify_all is a system call on Android (futex) even without waiters, and it came after
+// every primitive. The fences pair the waiter count with the sequence number (no lost wakeup).
+static std::atomic<int> g_seq_waiters{0};
+static inline void seq_notify() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (g_seq_waiters.load(std::memory_order_relaxed)) g_write_seq.notify_all();
+}
+static inline void seq_wait(u64 old) {
+    g_seq_waiters.fetch_add(1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    g_write_seq.wait(old, std::memory_order_acquire);
+    g_seq_waiters.fetch_sub(1, std::memory_order_relaxed);
+}
 static u64 g_wseq = 0;           // producer copy of g_write_seq
 static u32 g_state_next = 0;
 static int g_state_cur = -1;     // slot holding the snapshot of g_cur (+ CLUT), -1 = none
@@ -901,7 +921,7 @@ static u64 sw_min_done() {
 static void wait_done(u64 target) {
     if (g_write_seq.load(std::memory_order_relaxed) < target) {
         g_write_seq.store(g_wseq, std::memory_order_release);
-        g_write_seq.notify_all();
+        seq_notify();
     }
     for (int spins = 0; min_done() < target; spins++) {
         if (spins < 2000) _mm_pause();
@@ -927,7 +947,7 @@ static void worker_main(int k) {
                 spins++;
             }
             if (avail == my) {
-                g_write_seq.wait(my, std::memory_order_acquire);
+                seq_wait(my);
                 continue;
             }
         }
@@ -1005,7 +1025,7 @@ static void gpu_main() {
                 spins++;
             }
             if (avail == my) {
-                g_write_seq.wait(my, std::memory_order_acquire);
+                seq_wait(my);
                 continue;
             }
         }
@@ -1061,7 +1081,7 @@ void raster_state_vram(u8* vram, u32* clut512, bool load) {
         g_state_clut = clut512;
         enqueue_special(load ? -11 : -10, 0);
         g_write_seq.store(g_wseq, std::memory_order_release);
-        g_write_seq.notify_all();
+        seq_notify();
         wait_done(g_wseq);
     } else {
         raster_flush();
@@ -1084,7 +1104,7 @@ void raster_represent() {
     if (!g_gpu_on) return;
     enqueue_special(-9, 0);
     g_write_seq.store(g_wseq, std::memory_order_release);
-    g_write_seq.notify_all();
+    seq_notify();
 }
 
 // local -> host transfer in GPU-only mode: the renderer brings its memory copy up to date for the
@@ -1093,7 +1113,7 @@ void raster_gpu_readback(const CopyInfo& r) {
     g_readq = r;
     enqueue_special(-8, 0);
     g_write_seq.store(g_wseq, std::memory_order_release);
-    g_write_seq.notify_all();
+    seq_notify();
     wait_done(g_wseq);
 }
 
@@ -1105,7 +1125,7 @@ void raster_copy(const CopyInfo& ci) {
     enqueue_special(-7, slot);
     g_copyq_done[slot] = g_wseq;
     g_write_seq.store(g_wseq, std::memory_order_release);
-    g_write_seq.notify_all();
+    seq_notify();
 }
 
 void raster_init(int threads) {
@@ -1193,7 +1213,7 @@ static void add_range(std::vector<Range>& v, Range r) {
             g_flush_count[4]++;
             // commands may be enqueued but not yet published by the caller: publish before waiting
             g_write_seq.store(g_wseq, std::memory_order_release);
-            g_write_seq.notify_all();
+            seq_notify();
             wait_done(g_wseq);
             v.clear();
         }
@@ -1245,7 +1265,7 @@ void raster_clut_changed() { g_clut_version++; }
 static void enqueue_special(int prim, u32 arg) {
     if (g_wseq - min_done() >= CMD_RING) {
         u64 t0 = __rdtsc();
-        for (g_write_seq.store(g_wseq, std::memory_order_release), g_write_seq.notify_all(); g_wseq - min_done() >= CMD_RING;) _mm_pause();
+        for (g_write_seq.store(g_wseq, std::memory_order_release), seq_notify(); g_wseq - min_done() >= CMD_RING;) _mm_pause();
         g_wait_ticks_by[6] += __rdtsc() - t0;
         g_flush_wait_ticks += __rdtsc() - t0;
     }
@@ -1282,7 +1302,7 @@ void raster_clut_load(u64 tex0, u64 texclut) {
         enqueue_special(-4, slot);
         g_clutq_done[slot] = g_wseq;
         g_write_seq.store(g_wseq, std::memory_order_release);
-        g_write_seq.notify_all();
+        seq_notify();
         return;
     }
     // source area of the CLUT
@@ -1301,7 +1321,7 @@ void raster_clut_load(u64 tex0, u64 texclut) {
     r.seq = g_wseq;
     add_range(g_read, r);
     g_write_seq.store(g_wseq, std::memory_order_release);
-    g_write_seq.notify_all();
+    seq_notify();
 }
 
 void raster_upload(const UploadInfo& u, const u8* data, size_t len) {
@@ -1336,10 +1356,11 @@ void raster_upload(const UploadInfo& u, const u8* data, size_t len) {
         add_range(g_uploaded, r);
     }
     g_write_seq.store(g_wseq, std::memory_order_release);
-    g_write_seq.notify_all();
+    seq_notify();
 }
 
 void raster_present(const PresentParams& p) {
+    if (g_sw_present_hook) g_sw_present_hook(p);
     if (!queued()) {
         compose_present_rows(p, g_present_out, 0, 1);
         platform::submit_frame(g_present_out, p.w, p.out_h, p.w);
@@ -1357,7 +1378,7 @@ void raster_present(const PresentParams& p) {
     enqueue_special(-3, slot);
     slot_done[slot] = g_wseq;
     g_write_seq.store(g_wseq, std::memory_order_release);
-    g_write_seq.notify_all();
+    seq_notify();
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,7 +1429,7 @@ static void alloc_state(const DrawState& d) {
 static void enqueue_draw(int prim, const Vertex* v, int nv) {
     if (g_wseq - min_done() >= CMD_RING) {
         u64 t0 = __rdtsc();
-        for (g_write_seq.store(g_wseq, std::memory_order_release), g_write_seq.notify_all(); g_wseq - min_done() >= CMD_RING;) _mm_pause();
+        for (g_write_seq.store(g_wseq, std::memory_order_release), seq_notify(); g_wseq - min_done() >= CMD_RING;) _mm_pause();
         g_wait_ticks_by[6] += __rdtsc() - t0;
         g_flush_wait_ticks += __rdtsc() - t0;
     }
@@ -1421,6 +1442,30 @@ static void enqueue_draw(int prim, const Vertex* v, int nv) {
 
 void draw_primitive(int prim, const Vertex* v) {
     bool changed = setup();
+    static bool sc_narrowed = false;  // g_cur's scissor was narrowed for the previous primitive
+    static int sc_saved[2];
+    if (sc_narrowed) {
+        if (!changed) {
+            g_cur.scax0 = sc_saved[0];
+            g_cur.scax1 = sc_saved[1];
+            changed = true;
+        }
+        sc_narrowed = false;
+    }
+    Vertex hv[3];
+    if (g_sw_prim_hook) {
+        int sx0 = g_cur.scax0, sx1 = g_cur.scax1;
+        if (g_sw_prim_hook(g_cur, prim, v, hv, &sx0, &sx1)) {
+            v = hv;
+            if (sx0 != g_cur.scax0 || sx1 != g_cur.scax1) {
+                sc_saved[0] = g_cur.scax0;
+                sc_saved[1] = g_cur.scax1;
+                g_cur.scax0 = sx0;
+                g_cur.scax1 = sx1;
+                sc_narrowed = changed = true;
+            }
+        }
+    }
     const DrawState& ds = g_cur;
     g_prims_drawn++;
     if (census_active()) census_draw(ds, prim, v);
@@ -1460,7 +1505,13 @@ void draw_primitive(int prim, const Vertex* v) {
         enqueue_draw(prim, v, nv);
         slot.last_use = g_wseq;
         g_write_seq.store(g_wseq, std::memory_order_release);
-        g_write_seq.notify_all();
+        // a sleeping renderer is woken every 256 draws (and by every other command and wait): one
+        // wake per draw kept both threads in system calls
+        static u64 last_wake = 0;
+        if (g_wseq - last_wake >= 256) {
+            last_wake = g_wseq;
+            seq_notify();
+        }
         return;
     }
     bool sync = g_nworkers == 0 || g_draw_stats_active;
@@ -1519,7 +1570,7 @@ void draw_primitive(int prim, const Vertex* v) {
             add_range(g_written, fbr);
             if (zwrite) add_range(g_written, zr);
             g_write_seq.store(g_wseq, std::memory_order_release);
-            g_write_seq.notify_all();
+            seq_notify();
             return;
         } else {
             // read-after-write on the texture, write-after-read on frame/z buffer
@@ -1544,7 +1595,7 @@ void draw_primitive(int prim, const Vertex* v) {
                 // dependency on queued primitives: let the workers synchronize among themselves
                 // instead of stalling the emulation thread
                 g_flush_count[raw >= war ? 1 : 2]++;
-                for (g_write_seq.store(g_wseq, std::memory_order_release), g_write_seq.notify_all(); g_wseq - min_done() >= CMD_RING;) _mm_pause();
+                for (g_write_seq.store(g_wseq, std::memory_order_release), seq_notify(); g_wseq - min_done() >= CMD_RING;) _mm_pause();
                 g_cmds[g_wseq & (CMD_RING - 1)].prim = -1;
                 g_barrier_seq = g_wseq;  // commands before the barrier (seq <= this) are complete afterwards
                 g_wseq++;
@@ -1556,7 +1607,7 @@ void draw_primitive(int prim, const Vertex* v) {
             if (zwrite) add_range(g_written, zr);
             if (ds.tme) add_range(g_read, tr);
             g_write_seq.store(g_wseq, std::memory_order_release);
-            g_write_seq.notify_all();
+            seq_notify();
             return;
         }
     }

@@ -10,5 +10,6 @@ void path3_fifo(const u8* data, u32 qwc);  // CPU writes to GIF FIFO
 u32 read_reg(u32 addr);
 void write_reg(u32 addr, u32 v);
 void set_path3_mask(bool m);
+void process_path(int path, const u8* data, u32 qwc);  // 0..2, on the GS front end (gspipe.cpp)
 
 }  // namespace gif

@@ -83,6 +83,23 @@ An unofficial pack with all 7,604 textures of the game upscaled 4 times (7.5 GB,
 folder of `Grandia3.exe` so that a `textures` folder sits next to it; F8 switches the textures on and
 off. The pack only works with this version, not with PCSX2.
 
+## Android (test version)
+
+There is a test version for Android phones under [Releases](../../releases) (marked as pre-release,
+file `Grandia3-Android-<version>.apk`). Its version number shows the PC version it matches: Android
+1.0.7-beta1 has the features of PC v1.0.7.
+
+- As on the PC you need your own disc image: at the first start the app asks for your Grandia III (USA)
+  disc 1 ISO (choose it in the file picker, e.g. from your Download folder). It is read where it is,
+  not copied.
+- Install the APK directly (allow installing apps from your browser or file manager). There is no
+  Play Store version.
+- Touch controls are shown over the picture (they hide while a controller is used). The settings are
+  behind the three-bar button at the top, or SELECT+START.
+- So far it has only been tested on one phone (Snapdragon 8 Elite Gen 5). Phones with an older
+  Snapdragon may be too slow; Exynos, Tensor and Dimensity phones are untested. Please report how it
+  runs on yours in the [Issues](../../issues) (phone model, chip, what you tried).
+
 ## Problems?
 
 The game writes `grandia3.log` next to itself. Please attach it when you report a problem in the
@@ -113,6 +130,10 @@ For developers; players only need the download above.
    and a rebuild add the translation.
 
 Switches for testing and development are listed in `runtime/src/main.cpp`.
+
+Android: steps 2, 3 and 5 as above, then `python tools/build_android.py` (needs JDK 17, Android SDK
+platform 35, build-tools 35.0.1 and NDK r29 in `toolchain/`; Windows host). The Android runtime is in
+`runtime/android/`; notes on its Vulkan renderer in `docs/ANDROID_VULKAN_RENDERER.md`.
 
 ## License
 

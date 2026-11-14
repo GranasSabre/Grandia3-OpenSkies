@@ -690,6 +690,16 @@ int register_aot(u64 image_hash, AotFn fn) {
     aot_table()[image_hash] = fn;
     return 0;
 }
+// images whose translation leaves the MAC/status flags of the program end uncommitted (no run of the
+// image can read them, tools/vu_recomp.py): --vu-verify does not compare those at the end
+static std::set<u64>& end_mac_free() {
+    static std::set<u64> s;
+    return s;
+}
+int register_aot_end_mac_free(u64 image_hash) {
+    end_mac_free().insert(image_hash);
+    return 0;
+}
 bool g_vu_aot = true;      // --vu-interp disables translated code
 bool g_vu_verify = false;  // --vu-verify: run interpreter and translation, compare results
 
@@ -722,6 +732,7 @@ static void prepare(VUState& v) {
 }
 
 static bool same_state(const VUState& a, const VUState& b, std::string& why) {
+    bool flags = !end_mac_free().count(a.image_hash);
     char t[160];
     for (int i = 1; i < 32; i++)
         if (memcmp(&a.vf[i], &b.vf[i], 16)) {
@@ -735,11 +746,11 @@ static bool same_state(const VUState& a, const VUState& b, std::string& why) {
     if (memcmp(&a.acc, &b.acc, 16)) { why = "acc"; return false; }
     if (memcmp(&a.q, &b.q, 4)) { why = "q"; return false; }
     if (memcmp(&a.p, &b.p, 4)) { why = "p"; return false; }
-    if (a.mac != b.mac) { snprintf(t, sizeof(t), "mac %x vs %x", a.mac, b.mac); why = t; return false; }
+    if (flags && a.mac != b.mac) { snprintf(t, sizeof(t), "mac %x vs %x", a.mac, b.mac); why = t; return false; }
     if (a.clip != b.clip) { snprintf(t, sizeof(t), "clip %x vs %x", a.clip, b.clip); why = t; return false; }
     // sticky status bits are not compared: translated code skips MAC flag updates no instruction can
     // observe (tools/vu_recomp.py, only for images without status flag reads)
-    if (a.status != b.status) { why = "status"; return false; }
+    if (flags && a.status != b.status) { why = "status"; return false; }
     if (a.pc != b.pc) { snprintf(t, sizeof(t), "pc %x vs %x", a.pc, b.pc); why = t; return false; }
     if (a.r != b.r) { why = "R"; return false; }
     return true;

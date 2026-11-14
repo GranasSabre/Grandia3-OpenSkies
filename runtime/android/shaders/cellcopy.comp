@@ -1,0 +1,15 @@
+#version 450
+// Refresh from another surface of the same pixel size: a list of cells (source x y, destination
+// x y in scaled pixels), one workgroup layer per cell. Replaces one vkCmdCopyImage per run of cells
+// (a buffer read as another format moves its blocks around: thousands of tiny copies per frame).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform U { ivec4 info; } u;  // cell width, cell height (scaled), cell count
+layout(set = 0, binding = 0) uniform usampler2D src;
+layout(r32ui, set = 0, binding = 1) uniform writeonly uimage2D dst;
+layout(std430, set = 0, binding = 2) readonly buffer Cells { ivec4 cell[]; };
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= u.info.x || o.y >= u.info.y) return;
+    ivec4 c = cell[gl_GlobalInvocationID.z];
+    imageStore(dst, c.zw + o, uvec4(texelFetch(src, c.xy + o, 0).x));
+}

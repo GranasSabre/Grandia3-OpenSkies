@@ -127,6 +127,7 @@ USE_HIST = True       # VI write history needed at all
 ACC_BIT = 32
 VALID = {}
 ENTRIES = set()       # pcs the dispatch switch may enter (others fall back to the interpreter)
+END_MAC_FREE = False  # no run can observe the MAC flags of the previous run (see analyze)
 FMAC_ACC = {'ADDA', 'SUBA', 'MADDA', 'MSUBA', 'MULA'}
 
 
@@ -563,10 +564,109 @@ def analyze(ins, by_pc, bad):
             nodes.append(((x.pc + 8) & MASK, ('end', x.pc)))
     succ = {n: successors(by_pc, n) for n in nodes}
 
+    # Dispatch entries: the program's entry table (no FMAC work happens there; the runtime entries
+    # seen all lie below 0x300), return points of BAL/JALR (JR targets), continuations after an
+    # E bit, and JALR targets loaded as constants (IADDIU vi, vi0, imm right before the JALR).
+    unresolved = 0
+    for x in ins:
+        if x.pc in bad:
+            continue
+        if x.pc < 0x300:
+            ENTRIES.add(x.pc)
+        if x.lop in ('BAL', 'JALR') or x.ebit:
+            ENTRIES.add((x.pc + 16) & MASK)
+        if x.lop == 'JALR':
+            reg = FS(x.lower) & 15
+            found = None
+            for k in range(1, 16):
+                y = by_pc[(x.pc - 8 * k) & MASK]
+                if y.lop in BRANCHES:
+                    break
+                if any(r == reg for r, _ in vi_writes(y)):
+                    if y.lop == 'IADDIU' and (FS(y.lower) & 15) == 0:
+                        found = (((y.lower & 0x7FF) | ((y.lower >> 10) & 0x7800)) * 8) & MASK
+                    break
+            if found is None:
+                unresolved += 1
+            else:
+                ENTRIES.add(found)
     # MAC flag liveness: a push is observable if some path reaches a MAC read at least 3 instructions
     # later before a later push became visible (3 instructions after it), the program end while it is
-    # the latest push (flush commits everything), or an unknown jump target.
+    # the latest push (flush commits everything), or an unknown jump target. JR/JALR continue at the
+    # dispatch entries when every JALR target is resolved (the translated code can only enter there;
+    # any other target would leave to the interpreter, which the runtime logs).
+    # Targets per JR/JALR: a JALR goes to its resolved constant; a JR goes to the return points of the
+    # calls (pc + 16 of every BAL/JALR) when its register is written by nothing but call links.
+    link_writers = {}
+    for x in ins:
+        if x.pc in bad:
+            continue
+        for r, _ in vi_writes(x):
+            link_writers.setdefault(r, set()).add(x.lop)
+    ret_points = [((x.pc + 16) & MASK, None) for x in ins if x.pc not in bad and x.lop in ('BAL', 'JALR')]
+    jalr_target = {}
+    for x in ins:
+        if x.pc in bad or x.lop != 'JALR':
+            continue
+        reg = FS(x.lower) & 15
+        for k in range(1, 16):
+            y = by_pc[(x.pc - 8 * k) & MASK]
+            if y.lop in BRANCHES:
+                break
+            if any(r == reg for r, _ in vi_writes(y)):
+                if y.lop == 'IADDIU' and (FS(y.lower) & 15) == 0:
+                    jalr_target[x.pc] = ((((y.lower & 0x7FF) | ((y.lower >> 10) & 0x7800)) * 8) & MASK, None)
+                break
+
+    def dyn_targets(node):
+        """target nodes of the JR/JALR whose delay slot is node, or None (unknown)"""
+        if node[1] is None or node[1][0] != 'ds':
+            return None
+        b = by_pc[node[1][1]]
+        if b.lop == 'JALR':
+            t = jalr_target.get(b.pc)
+            return [t] if t in succ else None
+        reg = FS(b.lower) & 15
+        if reg and link_writers.get(reg, set()) <= {'BAL', 'JALR'} and all(t in succ for t in ret_points):
+            return ret_points
+        return None
     status_used = any(x.lop in STATUS_USERS and not x.ibit for x in ins if x.pc not in bad)
+    # Can a run observe the MAC value the previous run left behind? Only a MAC read reached from an
+    # entry before a push of its own run became visible (3 instructions after it). If not (and no
+    # status flag reads exist: sticky bits accumulate across runs), the latest push at the program end
+    # needs no commit either. The interpreter fallback (dispatch target outside the entries) is logged.
+    global END_MAC_FREE
+    end_observable = status_used
+    if not end_observable:
+        stack = [((e, None), None) for e in sorted(ENTRIES) if (e, None) in succ]
+        seen = set()
+        while stack and not end_observable:
+            m, kf = stack.pop()
+            if m == 'END':
+                continue
+            if isinstance(m, tuple) and m[0] == 'DYN':
+                ts = dyn_targets(m[1])
+                if ts is None:
+                    end_observable = True
+                else:
+                    stack += [(q, kf) for q in ts]
+                continue
+            if m not in succ:
+                end_observable = True
+                continue
+            if (m, kf) in seen:
+                continue
+            seen.add((m, kf))
+            y = by_pc[m[0]]
+            if not y.ibit and y.lop in MAC_READERS:
+                end_observable = True
+                continue
+            nkf = 0 if (kf is None and pushes_mac(y)) else (kf + 1 if kf is not None else None)
+            if nkf is not None and nkf >= 3:
+                continue
+            for q in succ[m]:
+                stack.append((('DYN', m) if q == 'DYN' else q, nkf))
+    END_MAC_FREE = not end_observable
     dead = 0
     total = 0
     for n in nodes:
@@ -577,12 +677,20 @@ def analyze(ins, by_pc, bad):
         if status_used:
             continue
         live = False
-        stack = [(m, 0, None) for m in succ[n]]
+        stack = [(('DYN', n) if m == 'DYN' else m, 0, None) for m in succ[n]]
         seen = set()
         while stack and not live:
             m, dp, kf = stack.pop()
             if m == 'END':
-                live = kf is None
+                live = kf is None and not END_MAC_FREE
+                continue
+            if isinstance(m, tuple) and m[0] == 'DYN':
+                ts = dyn_targets(m[1])
+                if ts is None:
+                    live = True
+                else:
+                    for q in ts:
+                        stack.append((q, dp, kf))
                 continue
             if m == 'DYN' or m not in succ:
                 live = True
@@ -599,7 +707,7 @@ def analyze(ins, by_pc, bad):
             if nkf is not None and nkf >= 3:
                 continue
             for q in succ[m]:
-                stack.append((q, min(dp + 1, 3), nkf))
+                stack.append((('DYN', m) if q == 'DYN' else q, min(dp + 1, 3), nkf))
         if not live:
             DEAD_MAC.add(n)
             dead += 1
@@ -638,32 +746,6 @@ def analyze(ins, by_pc, bad):
                 plain += 1
     USE_HIST = hist_needed > 0
 
-    # Dispatch entries: the program's entry table (no FMAC work happens there; the runtime entries
-    # seen all lie below 0x300), return points of BAL/JALR (JR targets), continuations after an
-    # E bit, and JALR targets loaded as constants (IADDIU vi, vi0, imm right before the JALR).
-    unresolved = 0
-    for x in ins:
-        if x.pc in bad:
-            continue
-        if x.pc < 0x300:
-            ENTRIES.add(x.pc)
-        if x.lop in ('BAL', 'JALR') or x.ebit:
-            ENTRIES.add((x.pc + 16) & MASK)
-        if x.lop == 'JALR':
-            reg = FS(x.lower) & 15
-            found = None
-            for k in range(1, 16):
-                y = by_pc[(x.pc - 8 * k) & MASK]
-                if y.lop in BRANCHES:
-                    break
-                if any(r == reg for r, _ in vi_writes(y)):
-                    if y.lop == 'IADDIU' and (FS(y.lower) & 15) == 0:
-                        found = (((y.lower & 0x7FF) | ((y.lower >> 10) & 0x7800)) * 8) & MASK
-                    break
-            if found is None:
-                unresolved += 1
-            else:
-                ENTRIES.add(found)
     # shadow validity: forward "must" analysis over the instruction graph (writes make shadows valid)
     ALL = (1 << 33) - 1
     writes = {}
@@ -692,7 +774,7 @@ def analyze(ins, by_pc, bad):
                     inwork.add(m)
     VALID.update(vin)
     return (f'MAC pushes {total}, dead {dead}; branch VI reads plain {plain}, with hazard {hist_needed}; '
-            f'dispatch entries {len(ENTRIES)}, unresolved JALR {unresolved}')
+            f'dispatch entries {len(ENTRIES)}, unresolved JALR {unresolved}; end MAC free {int(END_MAC_FREE)}')
 
 
 def main():
@@ -812,6 +894,8 @@ def main():
     w('    return true;')
     w('}')
     w(f'static int reg_ = register_aot(0x{h:016x}ull, aot_{h:016x});')
+    if END_MAC_FREE:
+        w(f'static int endfree_ = register_aot_end_mac_free(0x{h:016x}ull);')
     w('}  // namespace vu')
     open(sys.argv[2], 'w').write('\n'.join(out) + '\n')
     print(f'image {h:016x}: {len(ins)} instructions, {len(bad)} unsupported labels -> {sys.argv[2]}')

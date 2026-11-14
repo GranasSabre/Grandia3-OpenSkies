@@ -2,6 +2,7 @@
 #include "gif.h"
 #include "../savestate.h"
 #include "../gs/gs.h"
+#include "gspipe.h"
 
 namespace gif {
 
@@ -78,10 +79,12 @@ static void process(int pi, const u8* data, u32 qwc) {
     }
 }
 
-void path1(const u8* data, u32 qwc) { process(0, data, qwc); }
-void path2(const u8* data, u32 qwc) { process(1, data, qwc); }
-void path3_dma(const u8* data, u32 qwc) { process(2, data, qwc); }
-void path3_fifo(const u8* data, u32 qwc) { process(2, data, qwc); }
+// With a GS front end thread the packets are handed over to it (gspipe.cpp), in order.
+void process_path(int path, const u8* data, u32 qwc) { process(path, data, qwc); }
+void path1(const u8* data, u32 qwc) { if (!gsp::fe_defer(0, data, qwc)) process(0, data, qwc); }
+void path2(const u8* data, u32 qwc) { if (!gsp::fe_defer(1, data, qwc)) process(1, data, qwc); }
+void path3_dma(const u8* data, u32 qwc) { if (!gsp::fe_defer(2, data, qwc)) process(2, data, qwc); }
+void path3_fifo(const u8* data, u32 qwc) { if (!gsp::fe_defer(2, data, qwc)) process(2, data, qwc); }
 void set_path3_mask(bool m) { g_p3_mask = m; }
 
 u32 read_reg(u32 addr) {

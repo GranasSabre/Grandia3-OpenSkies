@@ -262,8 +262,16 @@ void exec_upload_rows_m(u32* mem, const UploadInfo& u, const u8* data, size_t le
                 const u8* p = data + i0 * 3;
                 for (u32 i = 0; i < cnt; i++, p += 3) write_pixel_m(mem, u.dpsm, (x0 + i) & 2047, y, u.dbp, u.dbw, p[0] | (p[1] << 8) | (p[2] << 16));
             } else if (u.dpsm == PSMCT32) {
+                // runs inside one block (8 pixels wide): the block address once per run
                 const u8* p = data + i0 * 4;
-                for (u32 i = 0; i < cnt; i++, p += 4) memcpy(&mem[addr32((x0 + i) & 2047, y, u.dbp, u.dbw)], p, 4);
+                const u8* ct = columnTable32[y & 7];
+                for (u32 i = 0; i < cnt;) {
+                    int x = (x0 + i) & 2047;
+                    u32 run = std::min<u32>(cnt - i, 8 - (x & 7));
+                    u32* blk = mem + (addr32(x & ~7, y, u.dbp, u.dbw) - ct[0]);
+                    for (u32 j = 0; j < run; j++) memcpy(&blk[ct[(x & 7) + j]], p + (i + j) * 4, 4);
+                    i += run;
+                }
             } else {
                 const u8* p = data + i0 * 4;
                 for (u32 i = 0; i < cnt; i++, p += 4) {
@@ -275,17 +283,31 @@ void exec_upload_rows_m(u32* mem, const UploadInfo& u, const u8* data, size_t le
             break;
         case 16: {
             const u8* p = data + i0 * 2;
-            if (u.dpsm == PSMCT16)
-                for (u32 i = 0; i < cnt; i++, p += 2) memcpy(&((u16*)mem)[addr16((x0 + i) & 2047, y, u.dbp, u.dbw)], p, 2);
-            else
+            if (u.dpsm == PSMCT16) {
+                const u8* ct = columnTable16[y & 7];
+                for (u32 i = 0; i < cnt;) {
+                    int x = (x0 + i) & 2047;
+                    u32 run = std::min<u32>(cnt - i, 16 - (x & 15));
+                    u16* blk = (u16*)mem + (addr16(x & ~15, y, u.dbp, u.dbw) - ct[0]);
+                    for (u32 j = 0; j < run; j++) memcpy(&blk[ct[(x & 15) + j]], p + (i + j) * 2, 2);
+                    i += run;
+                }
+            } else
                 for (u32 i = 0; i < cnt; i++, p += 2) write_pixel_m(mem, u.dpsm, (x0 + i) & 2047, y, u.dbp, u.dbw, p[0] | (p[1] << 8));
             break;
         }
         case 8: {
             const u8* p = data + i0;
-            if (u.dpsm == PSMT8)
-                for (u32 i = 0; i < cnt; i++) ((u8*)mem)[addr8((x0 + i) & 2047, y, u.dbp, u.dbw)] = p[i];
-            else
+            if (u.dpsm == PSMT8) {
+                const u8* ct = columnTable8[y & 15];
+                for (u32 i = 0; i < cnt;) {
+                    int x = (x0 + i) & 2047;
+                    u32 run = std::min<u32>(cnt - i, 16 - (x & 15));
+                    u8* blk = (u8*)mem + (addr8(x & ~15, y, u.dbp, u.dbw) - ct[0]);
+                    for (u32 j = 0; j < run; j++) blk[ct[(x & 15) + j]] = p[i + j];
+                    i += run;
+                }
+            } else
                 for (u32 i = 0; i < cnt; i++) write_pixel_m(mem, u.dpsm, (x0 + i) & 2047, y, u.dbp, u.dbw, p[i]);
             break;
         }

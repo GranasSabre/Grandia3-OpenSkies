@@ -32,6 +32,10 @@ void idle_sleep();          // emulation thread idle: sleep about 1 ms, woken by
 
 // pipeline thread (or the emulation thread without the pipeline thread)
 void post_intc(int cause);
+// GS front end thread (second stage: GIF parsing, GS registers, primitive setup, presentation).
+// VIF1/VU1 hand their GIF packets over (true: queued, the caller does not process it).
+bool fe_defer(int path, const u8* data, u32 qwc);
+void enable_front_end(bool on);  // before start()
 
 std::string stats();
 void* worker_handle();

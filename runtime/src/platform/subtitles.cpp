@@ -4,7 +4,9 @@
 #include "../iop/cdvd.h"
 #include "../memory.h"
 #include "../spu2/spu2.h"
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -21,7 +23,7 @@ constexpr u32 BLOCKS = 2 * 1024 * 1024 / 16;
 struct Entry { u32 sector; u16 tag; };
 struct Region { u32 iop, bytes; u16 tag; u32 entry_off; };   // IOP buffer filled from a track
 struct Block { u16 tag; u32 off; };                          // 16-byte ADPCM block in sound RAM
-struct Line { float start, end; std::wstring text; };
+struct Line { float start, end; std::string text; };   // UTF-8
 
 u32 g_stz_lsn = 0, g_stz_sectors = 0;
 std::vector<Entry> g_entries;             // sorted by sector
@@ -50,12 +52,60 @@ u32 g_movie_off = 0;
 u16 g_cur_tag = 0;
 const Line* g_cur_line = nullptr;
 
+#ifdef _WIN32
 std::wstring widen(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
     std::wstring w(n, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
     return w;
 }
+
+// coverage (0..255) of the text in white, wrapped to max_w and centred, with a margin of m pixels
+bool text_coverage(const std::string& text, int fs, int max_w, int m, std::vector<u8>& t, int& W, int& H) {
+    std::wstring wt = widen(text);
+    HDC dc = CreateCompatibleDC(nullptr);
+    HFONT f = CreateFontW(-fs, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HGDIOBJ oldf = SelectObject(dc, f);
+    RECT r{0, 0, max_w, 0};
+    DrawTextW(dc, wt.c_str(), -1, &r, DT_CENTER | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX);
+    W = r.right + 2 * m;
+    H = r.bottom + 2 * m;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = W;
+    bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ oldbm = SelectObject(dc, bm);
+    memset(bits, 0, (size_t)W * H * 4);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    RECT tr{m, m, m + r.right, m + r.bottom};
+    DrawTextW(dc, wt.c_str(), -1, &tr, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+    GdiFlush();
+    const u32* src = (const u32*)bits;
+    t.resize((size_t)W * H);
+    for (size_t k = 0; k < t.size(); k++) t[k] = (u8)((src[k] >> 8) & 0xFF);
+    SelectObject(dc, oldbm);
+    DeleteObject(bm);
+    SelectObject(dc, oldf);
+    DeleteObject(f);
+    DeleteDC(dc);
+    return true;
+}
+#else
+}  // namespace
+}  // namespace subs
+namespace platform {
+// the same with the system's text rendering (platform_android.cpp)
+bool text_coverage(const std::string& text, int fs, int max_w, int m, std::vector<u8>& t, int& W, int& H);
+}
+namespace subs {
+namespace {
+using platform::text_coverage;
+#endif
 
 void load_lines(const std::string& lang) {
     FILE* f = fopen((exe_dir() + "\\lang\\sub_" + lang + ".tsv").c_str(), "rb");
@@ -70,8 +120,8 @@ void load_lines(const std::string& lang) {
         size_t a = s.find('\t'), b = a == std::string::npos ? a : s.find('\t', a + 1),
                c = b == std::string::npos ? b : s.find('\t', b + 1);
         if (c == std::string::npos) continue;
-        Line l{(float)atof(s.substr(a + 1, b - a - 1).c_str()), (float)atof(s.substr(b + 1, c - b - 1).c_str()), widen(s.substr(c + 1))};
-        for (size_t k; (k = l.text.find(L"\\n")) != std::wstring::npos;) l.text.replace(k, 2, L"\n");
+        Line l{(float)atof(s.substr(a + 1, b - a - 1).c_str()), (float)atof(s.substr(b + 1, c - b - 1).c_str()), s.substr(c + 1)};
+        for (size_t k; (k = l.text.find("\\n")) != std::string::npos;) l.text.replace(k, 2, "\n");
         g_lines[(u16)strtoul(s.substr(0, a).c_str(), nullptr, 16)].push_back(l);
         n++;
     }
@@ -217,11 +267,7 @@ bool pixels(int pic_w, int pic_h, std::vector<u32>& out, int& w, int& h, u64& ve
     }
     if (line != g_cur_line || tag != g_cur_tag) {
         if (tag != g_cur_tag) log_write(LOG_MAIN, "subtitles: track %03x", tag);
-        if (line) {
-            std::string u(WideCharToMultiByte(CP_UTF8, 0, line->text.c_str(), -1, nullptr, 0, nullptr, nullptr), '\0');
-            WideCharToMultiByte(CP_UTF8, 0, line->text.c_str(), -1, u.data(), (int)u.size(), nullptr, nullptr);
-            log_write(LOG_MAIN, "subtitles: %03x %.2f-%.2f %s", tag, line->start, line->end, u.c_str());
-        }
+        if (line) log_write(LOG_MAIN, "subtitles: %03x %.2f-%.2f %s", tag, line->start, line->end, line->text.c_str());
         g_cur_line = line;
         g_cur_tag = tag;
     }
@@ -229,31 +275,11 @@ bool pixels(int pic_w, int pic_h, std::vector<u32>& out, int& w, int& h, u64& ve
     if (line != drawn || pic_w != for_w || pic_h != for_h) {
         // white text with a dark outline, wrapped to 80% of the picture width
         int fs = std::max(14, pic_h * 42 / 1000), pad = std::max(2, fs / 9);
-        HDC dc = CreateCompatibleDC(nullptr);
-        HFONT f = CreateFontW(-fs, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
-        HGDIOBJ oldf = SelectObject(dc, f);
-        RECT r{0, 0, pic_w * 8 / 10, 0};
-        DrawTextW(dc, line->text.c_str(), -1, &r, DT_CENTER | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX);
-        int W = r.right + 2 * pad + 2, H = r.bottom + 2 * pad + 2;
-        BITMAPINFO bi{};
-        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-        bi.bmiHeader.biWidth = W;
-        bi.bmiHeader.biHeight = -H;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        void* bits = nullptr;
-        HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        HGDIOBJ oldbm = SelectObject(dc, bm);
-        memset(bits, 0, (size_t)W * H * 4);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(255, 255, 255));
-        RECT tr{pad + 1, pad + 1, pad + 1 + r.right, pad + 1 + r.bottom};
-        DrawTextW(dc, line->text.c_str(), -1, &tr, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
-        GdiFlush();
-        // text coverage, and the outline as its dilation (separable square max filter)
-        const u32* src = (const u32*)bits;
-        std::vector<u8> t((size_t)W * H), tmp((size_t)W * H), o((size_t)W * H);
-        for (size_t k = 0; k < t.size(); k++) t[k] = (u8)((src[k] >> 8) & 0xFF);
+        std::vector<u8> t;
+        int W = 0, H = 0;
+        if (!text_coverage(line->text, fs, pic_w * 8 / 10, pad + 1, t, W, H) || W <= 0 || H <= 0) return false;
+        // the outline as the text's dilation (separable square max filter)
+        std::vector<u8> tmp((size_t)W * H), o((size_t)W * H);
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++) {
                 u8 m = 0;
@@ -279,11 +305,6 @@ bool pixels(int pic_w, int pic_h, std::vector<u32>& out, int& w, int& h, u64& ve
             u32 g = a > 0 ? (u32)(255 * at / a + 0.5f) : 0;
             px[k] = ((u32)(a * 255 + 0.5f) << 24) | (g << 16) | (g << 8) | g;
         }
-        SelectObject(dc, oldbm);
-        DeleteObject(bm);
-        SelectObject(dc, oldf);
-        DeleteObject(f);
-        DeleteDC(dc);
         bw = W;
         bh = H;
         for_w = pic_w;

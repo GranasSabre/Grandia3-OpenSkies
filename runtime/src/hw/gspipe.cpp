@@ -51,6 +51,12 @@ void* worker_handle() { return g_thread; }
 
 static inline u32 pad16(u32 n) { return (n + 15) & ~15u; }
 
+// GS front end stage (below): the pipeline worker forwards these records to it when it runs
+enum FeKind : u32 { F_PAD, F_GIF, F_GIF_REG, F_PRIV, F_VBLANK, F_REPRESENT };
+static bool g_fe = false, g_fe_wanted = false;
+static void fe_push(u32 kind, u32 aux, u64 arg, const void* data, u32 len);
+static void fe_vblank();
+
 static void exec(const Rec& r, const u8* p) {
     u32 aux = r.kind >> 16;
     switch (r.kind & 0xFFFF) {
@@ -58,23 +64,39 @@ static void exec(const Rec& r, const u8* p) {
     case K_VIF1_WORDS: vif::transfer_tag_words(1, p); break;
     case K_PATH3: gif::path3_dma(p, r.len / 16); break;
     case K_VIF1_REG: vif::write_reg(0x10003C00u | (aux & 0x3FF), (u32)r.arg); break;
-    case K_GIF_REG: gif::write_reg(0x10003000u | (aux & 0xFFF), (u32)r.arg); break;
-    case K_PRIV: gs::priv_apply(aux, r.arg); break;
-    case K_VBLANK: gs::present_frame(); break;
-    case K_REPRESENT: gs::raster_represent(); break;
+    case K_GIF_REG:
+        if (g_fe) fe_push(F_GIF_REG, aux, r.arg, nullptr, 0);
+        else gif::write_reg(0x10003000u | (aux & 0xFFF), (u32)r.arg);
+        break;
+    case K_PRIV:
+        if (g_fe) fe_push(F_PRIV, aux, r.arg, nullptr, 0);
+        else gs::priv_apply(aux, r.arg);
+        break;
+    case K_VBLANK:
+        if (g_fe) fe_vblank();
+        else gs::present_frame();
+        break;
+    case K_REPRESENT:
+        if (g_fe) fe_push(F_REPRESENT, 0, 0, nullptr, 0);
+        else gs::raster_represent();
+        break;
     }
 }
 
-// The producer waits until done() holds: a short spin, then the worker's wake event (the 1 ms
-// timeout only guards the loop; the worker signals after every record while somebody waits).
-template <class F>
-static void wait_until(F done) {
+// The producer waits until the worker's tail reaches `target`: a short spin, then the worker's wake
+// event (the 1 ms timeout only guards the loop). The worker signals once the tail passes the target,
+// not after every record (each SetEvent is a system call on Android, and the worker did that
+// thousands of times per frame while the game waited at a sync).
+static std::atomic<u64> g_wait_target{0};
+static void wait_tail(u64 target) {
+    auto done = [&] { return g_tail.load() >= target; };
     if (done()) return;
     u64 t0 = __rdtsc();
     for (int i = 0; i < 4000; i++) {
         _mm_pause();
         if (done()) { g_wait_ticks += __rdtsc() - t0; return; }
     }
+    g_wait_target.store(target);
     g_producer_waiting.fetch_add(1);
     while (!done()) WaitForSingleObject(g_wake_producer, 1);
     g_producer_waiting.fetch_sub(1);
@@ -92,7 +114,7 @@ static u64 reserve(u64 bytes) {
     u64 off = h & (RING - 1);
     if (off + bytes > RING) {
         u64 padlen = RING - off;
-        if (h + padlen - g_tail.load() > RING) { g_full_waits++; wait_until([&] { return h + padlen - g_tail.load() <= RING; }); }
+        if (h + padlen - g_tail.load() > RING) { g_full_waits++; wait_tail(h + padlen - RING); }
         Rec* r = (Rec*)(g_ring + off);
         r->kind = K_PAD;
         r->len = (u32)(padlen - 16);
@@ -100,7 +122,7 @@ static u64 reserve(u64 bytes) {
         h += padlen;
         publish(h);
     }
-    if (h + bytes - g_tail.load() > RING) { g_full_waits++; wait_until([&] { return h + bytes - g_tail.load() <= RING; }); }
+    if (h + bytes - g_tail.load() > RING) { g_full_waits++; wait_tail(h + bytes - RING); }
     return h;
 }
 
@@ -146,20 +168,25 @@ void vblank() {
     g_prev_vblank_end = g_head.load(std::memory_order_relaxed);
     if (g_tail.load() < prev) {
         g_vblank_waits++;
-        wait_until([&] { return g_tail.load() >= prev; });
+        wait_tail(prev);
     }
 }
 
+static void fe_drain();
 void sync_slow(int reason) {
     g_syncs[reason]++;
     u64 h = g_head.load(std::memory_order_relaxed);
-    if (g_tail.load() >= h) return;
-    g_sync_waits++;
-    wait_until([&] { return g_tail.load() >= h; });
+    if (g_tail.load() < h) {
+        g_sync_waits++;
+        wait_tail(h);
+    }
+    if (g_fe) fe_drain();  // everything the worker forwarded has been executed too
 }
 
+static DWORD g_fe_tid = 0;
 void post_intc(int cause) {
-    if (!g_threaded || GetCurrentThreadId() != g_worker_tid) {
+    DWORD tid = GetCurrentThreadId();
+    if (!g_threaded || (tid != g_worker_tid && !(g_fe && tid == g_fe_tid))) {
         kernel::raise_intc(cause);
         return;
     }
@@ -204,7 +231,7 @@ static DWORD WINAPI worker(void*) {
             if ((r->kind & 0xFFFF) != K_PAD) exec(*r, (const u8*)(r + 1));
             t += 16 + pad16(r->len);
             g_tail.store(t);
-            if (g_producer_waiting.load()) SetEvent(g_wake_producer);
+            if (g_producer_waiting.load() && t >= g_wait_target.load()) SetEvent(g_wake_producer);
         }
         g_busy_ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
     }
@@ -234,6 +261,144 @@ void start(bool threaded) {
     }
     SetThreadDescription(g_thread, L"GS pipeline");
     log_write(LOG_MAIN, "gs pipeline: own thread");
+    void fe_start();
+    if (g_fe_wanted) fe_start();
+}
+
+// ---------------------------------------------------------------------------
+// GS front end stage: GIF packets (copied by the worker), GIF/GS register writes, presentation.
+// One producer (the pipeline worker), one consumer (the front end thread); the emulation thread only
+// waits for it to drain (sync). The worker stays at most one vertical blank ahead of it.
+// ---------------------------------------------------------------------------
+static constexpr u64 FE_RING = 32ull << 20;
+static u8* g_fe_ring = nullptr;
+static HANDLE g_fe_thread = nullptr, g_fe_wake = nullptr, g_fe_wake_waiter = nullptr;
+alignas(64) static std::atomic<u64> g_fe_head{0};
+alignas(64) static std::atomic<u64> g_fe_tail{0};
+alignas(64) static std::atomic<int> g_fe_sleeping{0};
+static std::atomic<int> g_fe_waiting{0};
+static std::atomic<u64> g_fe_target{0};
+static std::atomic<u64> g_fe_busy{0};
+static u64 g_fe_prev_vblank = 0;  // front end ring position after the previous vertical blank (worker)
+
+void enable_front_end(bool on) { g_fe_wanted = on; }
+
+// any thread but the front end: wait until its tail reaches target
+static void fe_wait(u64 target) {
+    auto done = [&] { return g_fe_tail.load() >= target; };
+    if (done()) return;
+    for (int i = 0; i < 4000; i++) {
+        _mm_pause();
+        if (done()) return;
+    }
+    g_fe_target.store(target);
+    g_fe_waiting.fetch_add(1);
+    while (!done()) WaitForSingleObject(g_fe_wake_waiter, 1);
+    g_fe_waiting.fetch_sub(1);
+}
+static void fe_drain() { fe_wait(g_fe_head.load()); }
+
+static void fe_publish(u64 head) {
+    g_fe_head.store(head);
+    if (g_fe_sleeping.load()) SetEvent(g_fe_wake);
+}
+
+// worker thread
+static void fe_push(u32 kind, u32 aux, u64 arg, const void* data, u32 len) {
+    u64 bytes = 16 + pad16(len);
+    u64 h = g_fe_head.load(std::memory_order_relaxed);
+    u64 off = h & (FE_RING - 1);
+    if (off + bytes > FE_RING) {
+        u64 padlen = FE_RING - off;
+        if (h + padlen - g_fe_tail.load() > FE_RING) fe_wait(h + padlen - FE_RING);
+        Rec* r = (Rec*)(g_fe_ring + off);
+        r->kind = F_PAD;
+        r->len = (u32)(padlen - 16);
+        r->arg = 0;
+        h += padlen;
+        fe_publish(h);
+    }
+    if (h + bytes - g_fe_tail.load() > FE_RING) fe_wait(h + bytes - FE_RING);
+    Rec* r = (Rec*)(g_fe_ring + (h & (FE_RING - 1)));
+    r->kind = kind | (aux << 16);
+    r->len = len;
+    r->arg = arg;
+    if (len) memcpy(r + 1, data, len);
+    fe_publish(h + bytes);
+}
+
+bool fe_defer(int path, const u8* data, u32 qwc) {
+    if (!g_fe || GetCurrentThreadId() != g_worker_tid) return false;
+    while (qwc) {
+        u32 n = std::min(qwc, CHUNK / 16);
+        fe_push(F_GIF, (u32)path, 0, data, n * 16);
+        data += n * 16;
+        qwc -= n;
+    }
+    return true;
+}
+
+static void fe_vblank() {
+    fe_push(F_VBLANK, 0, 0, nullptr, 0);
+    // at most one frame between the worker and the front end
+    u64 prev = g_fe_prev_vblank;
+    g_fe_prev_vblank = g_fe_head.load(std::memory_order_relaxed);
+    fe_wait(prev);
+}
+
+static void fe_exec(const Rec& r, const u8* p) {
+    u32 aux = r.kind >> 16;
+    switch (r.kind & 0xFFFF) {
+    case F_GIF: gif::process_path((int)aux, p, r.len / 16); break;
+    case F_GIF_REG: gif::write_reg(0x10003000u | (aux & 0xFFF), (u32)r.arg); break;
+    case F_PRIV: gs::priv_apply(aux, r.arg); break;
+    case F_VBLANK: gs::present_frame(); break;
+    case F_REPRESENT: gs::raster_represent(); break;
+    }
+}
+
+static DWORD WINAPI fe_worker(void*) {
+    u64 t = 0;
+    for (;;) {
+        u64 h = g_fe_head.load();
+        if (t == h) {
+            bool more = false;
+            for (int i = 0; i < 2000 && !more; i++) {
+                _mm_pause();
+                more = g_fe_head.load(std::memory_order_acquire) != t;
+            }
+            if (!more) {
+                g_fe_sleeping.store(1);
+                if (g_fe_head.load() == t) WaitForSingleObject(g_fe_wake, INFINITE);
+                g_fe_sleeping.store(0);
+            }
+            continue;
+        }
+        u64 t0 = __rdtsc();
+        while (t != h) {
+            const Rec* r = (const Rec*)(g_fe_ring + (t & (FE_RING - 1)));
+            if ((r->kind & 0xFFFF) != F_PAD) fe_exec(*r, (const u8*)(r + 1));
+            t += 16 + pad16(r->len);
+            g_fe_tail.store(t);
+            if (g_fe_waiting.load() && t >= g_fe_target.load()) SetEvent(g_fe_wake_waiter);
+        }
+        g_fe_busy.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+void fe_start() {
+    g_fe_ring = (u8*)VirtualAlloc(nullptr, FE_RING, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_fe_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_fe_wake_waiter = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_fe_ring || !g_fe_wake || !g_fe_wake_waiter) return;
+    DWORD tid = 0;
+    g_fe_thread = CreateThread(nullptr, 8 * 1024 * 1024, fe_worker, nullptr, 0, &tid);
+    if (!g_fe_thread) return;
+    g_fe_tid = tid;
+    SetThreadDescription(g_fe_thread, L"GS front end");
+    g_fe = true;  // start() runs before the first transfer: nothing is queued yet
+    log_write(LOG_MAIN, "gs pipeline: GS front end on its own thread");
 }
 
 std::string stats() {
@@ -253,8 +418,13 @@ std::string stats() {
             last_syncs[i] = g_syncs[i];
         }
     u64 il = g_idle_loop_ticks;
-    snprintf(b, sizeof(b), "gs pipeline: worker busy %.0f%%, game waits for it %.1f%%, emu waits %.1f%% (sync %llu, vblank %llu, full %llu), %.1f MB queued, syncs:%s",
-             100.0 * (busy - last_busy) / span, 100.0 * (il - last_idle_loop) / span, 100.0 * (g_wait_ticks - last_wait) / span,
+    static u64 last_fe = 0;
+    u64 fe = g_fe_busy.load(std::memory_order_relaxed);
+    char feb[64] = "";
+    if (g_fe) snprintf(feb, sizeof feb, ", front end busy %.0f%%", 100.0 * (fe - last_fe) / span);
+    last_fe = fe;
+    snprintf(b, sizeof(b), "gs pipeline: worker busy %.0f%%%s, game waits for it %.1f%%, emu waits %.1f%% (sync %llu, vblank %llu, full %llu), %.1f MB queued, syncs:%s",
+             100.0 * (busy - last_busy) / span, feb, 100.0 * (il - last_idle_loop) / span, 100.0 * (g_wait_ticks - last_wait) / span,
              (unsigned long long)(g_sync_waits - last_sw), (unsigned long long)(g_vblank_waits - last_vw),
              (unsigned long long)(g_full_waits - last_fw), (g_bytes - last_bytes) / 1048576.0, syncs.empty() ? " none" : syncs.c_str());
     last_busy = busy;
