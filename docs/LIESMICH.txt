@@ -129,5 +129,5 @@ Das Programm schreibt grandia3.log neben sich. Bitte bei Fehlerberichten anhäng
 Lizenz
 ------
 Der Programmcode steht unter der MIT-Lizenz (Quellcode und LICENSE:
-https://github.com/GranasSabre/Grandia3-PC). Grandia III und alle Inhalte des Spiels gehören
+https://github.com/GranasSabre/Grandia3-OpenSkies). Grandia III und alle Inhalte des Spiels gehören
 Square Enix und Game Arts.

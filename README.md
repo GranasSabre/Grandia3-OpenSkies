@@ -1,4 +1,6 @@
-# Grandia III for PC
+# Grandia III: Open Skies
+
+*A native PC & Android port of Grandia III.*
 
 **Grandia III** (PlayStation 2, 2005) as a real PC game: sharper, wider and smoother than on the
 console, with savestates, subtitles and a German and French translation - and, if you like, as an

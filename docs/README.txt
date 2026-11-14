@@ -142,5 +142,5 @@ Direct3D 11.3 features; renderer = software in grandia3.ini is a (slow) fallback
 License
 -------
 The program code is under the MIT license (source code and LICENSE:
-https://github.com/GranasSabre/Grandia3-PC). Grandia III and everything in it belong to Square Enix
+https://github.com/GranasSabre/Grandia3-OpenSkies). Grandia III and everything in it belong to Square Enix
 and Game Arts.
