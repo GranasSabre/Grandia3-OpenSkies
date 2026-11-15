@@ -17,6 +17,7 @@
 #include <array>
 #include "gs/gs_drawstate.h"
 #include "gs/gs_mem.h"
+#include "gs/gs_texrep.h"
 #include "platform/platform.h"
 #include "ee/kernel.h"
 #include "vk_ctx.h"
@@ -755,21 +756,25 @@ static VkRenderPass make_draw_rp(bool z) {
 }
 
 // draw pipelines specialized per batch: the fragment shader's constant_id 0..22 (draw.frag SC_*)
-static constexpr int NSPEC = 24;  // (23: SC_DYN, 0 in the specialized pipelines)
+static constexpr int NSPEC = 23;
+static bool g_texrep_on = false;   // texture replacement images exist (lang/<code>_tex, lang/all_tex)
 static VkPipelineCache g_pcache = VK_NULL_HANDLE;
-static VkShaderModule g_draw_vs = VK_NULL_HANDLE, g_draw_fs[2] = {};
+// g_draw_fs: specialized shader (draw.frag); g_draw_gen_fs: the general pipeline (draw_general.frag)
+static VkShaderModule g_draw_vs = VK_NULL_HANDLE, g_draw_fs[2] = {}, g_draw_gen_fs[2] = {};
 static VkPipeline make_draw_pipe(bool z, const u32* spec = nullptr) {
     if (!g_draw_vs) {
         g_draw_vs = module(SPV_DRAW_VERT, sizeof(SPV_DRAW_VERT));
         g_draw_fs[0] = module(SPV_DRAW_FRAG, sizeof(SPV_DRAW_FRAG));
         g_draw_fs[1] = module(SPV_DRAW_Z_FRAG, sizeof(SPV_DRAW_Z_FRAG));
+        g_draw_gen_fs[0] = module(SPV_DRAW_GENERAL_FRAG, sizeof(SPV_DRAW_GENERAL_FRAG));
+        g_draw_gen_fs[1] = module(SPV_DRAW_GENERAL_Z_FRAG, sizeof(SPV_DRAW_GENERAL_Z_FRAG));
     }
     VkSpecializationMapEntry me[NSPEC];
     for (int i = 0; i < NSPEC; i++) me[i] = {(uint32_t)i, (uint32_t)(i * 4), 4};
     VkSpecializationInfo si{NSPEC, me, NSPEC * 4, spec};
     VkPipelineShaderStageCreateInfo st[2]{};
     st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, g_draw_vs, "main"};
-    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, g_draw_fs[z], "main",
+    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, spec ? g_draw_fs[z] : g_draw_gen_fs[z], "main",
              spec ? &si : nullptr};
     VkVertexInputBindingDescription vb{0, 68, VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription va[7] = {
@@ -872,8 +877,18 @@ static std::deque<PJob> g_pjobs;
 static std::vector<std::pair<u64, VkPipeline>> g_pjob_done;
 static bool g_pjob_thread = false;
 static VkPipeline draw_pipe_for(bool z, const u32* spec) {
+    static const bool no_spec = getenv("GRANDIA_VK_NO_SPEC") != nullptr;  // test: the general pipeline only
+    if (no_spec) return g_pipe_draw[z];
+    // test GRANDIA_VK_SPEC_GEN=i:v: batches whose constant i is v draw with the general pipeline
+    static int gen_i = -1; static u32 gen_v = 0;
+    static const bool gen_init = [] {
+        if (const char* e = getenv("GRANDIA_VK_SPEC_GEN")) { gen_i = atoi(e); if (const char* c = strchr(e, ':')) gen_v = (u32)atoi(c + 1); }
+        return true;
+    }();
+    (void)gen_init;
+    if (gen_i >= 0 && gen_i < NSPEC && spec[gen_i] == gen_v) return g_pipe_draw[z];
     u64 key = z ? 1 : 0;
-    static const int BITS[NSPEC] = {1, 4, 2, 1, 2, 2, 1, 1, 1, 1, 1, 3, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 2, 1};
+    static const int BITS[NSPEC] = {1, 4, 2, 1, 2, 2, 1, 1, 1, 1, 1, 3, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 2};
     int sh = 1;
     for (int i = 0; i < NSPEC; i++) {
         key |= (u64)(spec[i] & ((1u << BITS[i]) - 1)) << sh;
@@ -1088,6 +1103,12 @@ bool init(int scale) {
         vkCreateRenderPass(dev, &rp, nullptr, &g_rp_out);
     }
     pcache_load();
+    static bool texrep_init = false;
+    if (!texrep_init) {
+        texrep_init = true;
+        gs::texrep::init(false);
+        g_texrep_on = gs::texrep::have_pack();
+    }
     g_pipe_draw[0] = make_draw_pipe(false);
     g_pipe_draw[1] = make_draw_pipe(true);
     g_pipe_up = make_compute(SPV_UPSCALE_COMP, sizeof(SPV_UPSCALE_COMP));
@@ -1469,7 +1490,10 @@ struct TexEntry {
     u64 hash = 0;
     bool decoded = false;
     u64 last_use = 0;
+    // texture replacement (texrep): hash of the decoded texels, the inputs of the last key, the key
+    u64 data_hash = 0, rep_inputs = ~0ull, rep_key = 0;
 };
+static u64 st_tex_replaced = 0;
 static u64 st_tex_rehash = 0, st_up_same = 0;  // (st_up_same: uploaded blocks with unchanged content)
 
 static u64 blocks_hash(const std::vector<u16>& blocks) {
@@ -1587,7 +1611,17 @@ static TexEntry* decoded_texture(u32 tbp, u32 tbw, u32 tpsm, u32 tw, u32 th) {
     size_t bytes = (size_t)tw * th * bpp;
     VkDeviceSize off = ring_alloc(bytes, &p);
     if (p) {
-        decode_blocks(tpsm, tbp, tbw, tw, th, p, bpp);
+        if (g_texrep_on) {
+            // decoded in normal memory first (the ring is written once, not read back)
+            static std::vector<u8> buf;
+            buf.resize(bytes);
+            decode_blocks(tpsm, tbp, tbw, tw, th, buf.data(), bpp);
+            memcpy(p, buf.data(), bytes);
+            e.data_hash = gs::texrep::hash(buf.data(), bytes, tpsm | tw << 8 | (u64)th << 24);
+            e.rep_inputs = ~0ull;
+        } else {
+            decode_blocks(tpsm, tbp, tbw, tw, th, p, bpp);
+        }
         g_pre_up.push_back({e.im.img, off, (int)tw, (int)th});
         if (g_pre_up.size() >= 256) pre_flush_uploads();
     }
@@ -1644,6 +1678,7 @@ static DrawState g_prev_raw;
 static u32 g_clut[512];
 static bool g_clut_valid = false;
 static bool g_clut_dirty = true;   // CLUT changed since its last copy into the ring
+static u64 g_clut_version = 0;     // counts CLUT changes (replacement keys of palette textures)
 static u64 g_clut_gen = 0;         // ring generation of that copy
 static VkDeviceSize g_clut_off = 0;
 
@@ -1713,7 +1748,107 @@ struct TexBind {
     int ox = 0, oy = 0;
     int tfmt = 0;
     Surface* surf = nullptr;
+    bool rep = false;  // a replacement image (no mip levels: the game's levels are the original format)
 };
+
+// ---------------------------------------------------------------------------
+// Texture replacement (as gs_gpu.cpp apply_texrep): a decoded texture whose key has an image in
+// lang/<code>_tex or lang/all_tex is sampled from that image instead, a 32-bit texture k times the
+// size (the shader's path for scaled surfaces: format 0, texture scale k).
+// ---------------------------------------------------------------------------
+struct Rep {
+    Img im;
+    int k = 1;
+    bool none = false;
+};
+static std::unordered_map<u64, Rep> g_rep;
+
+// key of texel data + the palette entries / alpha expansion it is shown with (gs_gpu.cpp rep_key)
+static u64 rep_key(const DrawState& ds, const TexEntry* e, int tfmt) {
+    bool c16 = ds.cpsm == PSMCT16 || ds.cpsm == PSMCT16S;
+    bool pal = tfmt == 3 || tfmt == 4;
+    u64 k = e->data_hash;
+    if (pal) {
+        u32 n = tfmt == 3 ? 256 : 16, ent[256];
+        for (u32 i = 0; i < n; i++)
+            ent[i] = c16 ? (g_clut[(i + ds.csa * 16) & 511] & 0xFFFF) : (tfmt == 4 ? g_clut[(i + (ds.csa & 15) * 16) & 255] : g_clut[i]);
+        k = gs::texrep::hash(ent, n * 4, k ^ (c16 ? 0x16 : 0x32));
+    }
+    if ((pal && c16) || tfmt == 1 || tfmt == 2 || tfmt == 8) {
+        u32 t[3] = {ds.ta0, ds.ta1, (u32)ds.aem};
+        k = gs::texrep::hash(t, sizeof t, k);
+    }
+    return k;
+}
+
+static void create_rep(Rep& r, const gs::texrep::Image& img, u32 tw, u32 th, u64 key) {
+    int k = img.w / (int)tw;
+    if (k < 1 || k > 8 || img.w != k * (int)tw || img.h != k * (int)th) {
+        log_write(LOG_GS, "replacement %016llx: %dx%d is no integer multiple of %ux%u, ignored", (unsigned long long)key, img.w, img.h, tw, th);
+        r.none = true;
+        return;
+    }
+    // more detail than the internal resolution shows: box filter down to scale S (memory, aliasing)
+    int f = (k > S && k % S == 0) ? k / S : 1;
+    int w = img.w / f, h = img.h / f;
+    u8* p = nullptr;
+    VkDeviceSize off = 0;
+    if (!make_img(r.im, w, h, VK_FORMAT_R32_UINT, TEX_USAGE) || !(off = ring_alloc((size_t)w * h * 4, &p), p)) {
+        garbage(r.im);
+        r.none = true;
+        return;
+    }
+    u32* out = (u32*)p;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            if (f == 1) { out[(size_t)y * w + x] = img.px[(size_t)y * img.w + x]; continue; }
+            // straight alpha: colours weighted by alpha
+            u32 sr = 0, sg = 0, sb = 0, sa = 0, cr = 0, cg = 0, cb = 0;
+            for (int yy = 0; yy < f; yy++)
+                for (int xx = 0; xx < f; xx++) {
+                    u32 c = img.px[(size_t)(y * f + yy) * img.w + x * f + xx], a = c >> 24;
+                    sr += (c & 0xFF) * a; sg += (c >> 8 & 0xFF) * a; sb += (c >> 16 & 0xFF) * a; sa += a;
+                    cr += c & 0xFF; cg += c >> 8 & 0xFF; cb += c >> 16 & 0xFF;
+                }
+            u32 n = (u32)(f * f), a = (sa + n / 2) / n;
+            u32 r_ = sa ? (sr + sa / 2) / sa : cr / n, g_ = sa ? (sg + sa / 2) / sa : cg / n, b_ = sa ? (sb + sa / 2) / sa : cb / n;
+            out[(size_t)y * w + x] = r_ | g_ << 8 | b_ << 16 | a << 24;
+        }
+    g_pre_up.push_back({r.im.img, off, w, h});
+    if (g_pre_up.size() >= 256) pre_flush_uploads();
+    r.k = k / f;
+    log_write(LOG_GS, "replacement %016llx: %dx%d for %ux%u (scale %d)", (unsigned long long)key, w, h, tw, th, r.k);
+}
+
+static void apply_texrep(const DrawState& ds, TexEntry* e, TexBind& tb) {
+    bool pal = tb.tfmt == 3 || tb.tfmt == 4;
+    u64 in = e->data_hash * 0x9E3779B97F4A7C15ull ^ (pal ? g_clut_version : 0) * 0xC2B2AE3D27D4EB4Full ^
+             ((u64)ds.csa | (u64)ds.cpsm << 8 | (u64)ds.ta0 << 16 | (u64)ds.ta1 << 24 | (u64)ds.aem << 32);
+    if (in != e->rep_inputs) {
+        e->rep_inputs = in;
+        e->rep_key = rep_key(ds, e, tb.tfmt);
+    }
+    auto it = g_rep.find(e->rep_key);
+    if (it == g_rep.end()) {
+        const gs::texrep::Image* img = nullptr;
+        gs::texrep::State st = gs::texrep::lookup(e->rep_key, &img);
+        if (st == gs::texrep::LOADING) return;  // the original until the PNG is decoded
+        Rep& r = g_rep[e->rep_key];
+        if (st == gs::texrep::NONE) r.none = true;
+        else {
+            create_rep(r, *img, e->tw, e->th, e->rep_key);
+            gs::texrep::release(e->rep_key);
+        }
+        it = g_rep.find(e->rep_key);
+    }
+    Rep& r = it->second;
+    if (r.none) return;
+    tb.view = r.im.view;
+    tb.tscale = (float)r.k;
+    tb.tfmt = 0;
+    tb.rep = true;
+    st_tex_replaced++;
+}
 
 static TexBind resolve_texture(const DrawState& ds, Surface* fs, Surface* zs) {
     TexBind tb;
@@ -1774,6 +1909,7 @@ static TexBind resolve_texture(const DrawState& ds, Surface* fs, Surface* zs) {
     tb.view = e->im.view;
     tb.tscale = 1;
     tb.tfmt = tex_format_code(ds.tpsm, true);
+    if (g_texrep_on && !gpu_owned && e->decoded && e->im.view) apply_texrep(ds, e, tb);
     return tb;
 }
 
@@ -1836,7 +1972,7 @@ static void flush() {
     if (g_btme && tb.surf && (tb.surf == fs || tb.surf == zs)) bind_snapshot(tb.surf, tb);
     int nmips = 0;
     VkImageView mip_view[6] = {};
-    if (g_btme && ds.mxl > 0 && ds.mmin >= 2 && ds.mmin <= 5 && !ds.mtba && !tb.surf && g_cfg_mips) {
+    if (g_btme && ds.mxl > 0 && ds.mmin >= 2 && ds.mmin <= 5 && !ds.mtba && !tb.surf && !tb.rep && g_cfg_mips) {
         nmips = std::min<int>(ds.mxl, 6);
         for (int l = 1; l <= nmips; l++) {
             u64 m = l <= 3 ? ds.miptbp1 : ds.miptbp2;
@@ -2218,6 +2354,7 @@ void on_clut_load(u64 tex0, u64 texclut) {
         }
         memcpy(g_clut, tmp, sizeof(tmp));
         g_clut_dirty = true;
+        g_clut_version++;
         g_clut_valid = true;
     }
 }
@@ -2472,6 +2609,12 @@ std::string stats() {
     l_gcopy = st_gpu_copy_cells; l_skip = st_skip_cells; l_rehash = st_tex_rehash; l_passes = st_passes; l_vers = st_tex_versions;
     l_draws = st_draws; l_batches = st_batches; l_refresh = st_refresh_cells; l_rbc = st_readback_cells; l_rb = st_readbacks;
     l_dec = st_tex_decodes; l_hits = st_tex_hits; l_stale = st_stale_texels; l_self = st_self;
+    static u64 l_rep = 0;
+    if (st_tex_replaced != l_rep) {
+        size_t n = strlen(b);
+        snprintf(b + n, sizeof(b) - n, ", replaced textures %llu", (unsigned long long)(st_tex_replaced - l_rep));
+        l_rep = st_tex_replaced;
+    }
     return b;
 }
 
@@ -2491,6 +2634,7 @@ void state_vram(u8* vram, u32* clut, bool load) {
     for (u32 b = 0; b < 16384; b++) mark_cpu_written(b);
     memcpy(g_clut, clut, sizeof(g_clut));
     g_clut_dirty = true;
+    g_clut_version++;
     g_clut_valid = true;
 }
 

@@ -181,6 +181,40 @@ bool g3_show_message(const std::string& utf8) {
     return !j.failed();
 }
 
+// a PNG file as straight (not premultiplied) RGBA, R in the low byte (texrep_android.cpp; WIC on the PC)
+bool g3_decode_png(const std::string& path, int& w, int& h, std::vector<u32>& px) {
+    Jni j;
+    JNIEnv* env = j.env;
+    if (!env) return false;
+    jclass cFactory = env->FindClass("android/graphics/BitmapFactory");
+    jclass cOpts = env->FindClass("android/graphics/BitmapFactory$Options");
+    jclass cBitmap = env->FindClass("android/graphics/Bitmap");
+    jclass cConfig = env->FindClass("android/graphics/Bitmap$Config");
+    if (j.failed() || !cFactory || !cOpts || !cBitmap || !cConfig) return false;
+    jobject opts = env->NewObject(cOpts, env->GetMethodID(cOpts, "<init>", "()V"));
+    env->SetBooleanField(opts, env->GetFieldID(cOpts, "inPremultiplied", "Z"), JNI_FALSE);
+    env->SetBooleanField(opts, env->GetFieldID(cOpts, "inScaled", "Z"), JNI_FALSE);
+    jobject argb = env->GetStaticObjectField(cConfig, env->GetStaticFieldID(cConfig, "ARGB_8888", "Landroid/graphics/Bitmap$Config;"));
+    env->SetObjectField(opts, env->GetFieldID(cOpts, "inPreferredConfig", "Landroid/graphics/Bitmap$Config;"), argb);
+    jobject bm = env->CallStaticObjectMethod(
+        cFactory, env->GetStaticMethodID(cFactory, "decodeFile", "(Ljava/lang/String;Landroid/graphics/BitmapFactory$Options;)Landroid/graphics/Bitmap;"),
+        env->NewStringUTF(path.c_str()), opts);
+    if (j.failed() || !bm) return false;
+    w = env->CallIntMethod(bm, env->GetMethodID(cBitmap, "getWidth", "()I"));
+    h = env->CallIntMethod(bm, env->GetMethodID(cBitmap, "getHeight", "()I"));
+    int row = env->CallIntMethod(bm, env->GetMethodID(cBitmap, "getRowBytes", "()I"));
+    bool ok = w > 0 && h > 0 && w <= 8192 && h <= 8192 && row == w * 4 && !j.failed();
+    if (ok) {
+        // ARGB_8888 is R, G, B, A in memory; an unpremultiplied bitmap copies its values unchanged
+        px.resize((size_t)w * h);
+        jobject bb = env->NewDirectByteBuffer(px.data(), (jlong)px.size() * 4);
+        env->CallVoidMethod(bm, env->GetMethodID(cBitmap, "copyPixelsToBuffer", "(Ljava/nio/Buffer;)V"), bb);
+        ok = !j.failed();
+    }
+    env->CallVoidMethod(bm, env->GetMethodID(cBitmap, "recycle", "()V"));
+    return ok && !j.failed();
+}
+
 namespace platform {
 
 bool text_coverage(const std::string& text, int fs, int max_w, int m, std::vector<u8>& t, int& W, int& H) {

@@ -10,6 +10,11 @@
 // Per batch the renderer builds a pipeline with these fixed (gs_vk.cpp draw_spec): the branches on
 // them fold away, which shortens the shader a lot (with rasterization order access the latency of
 // one fragment holds up the next one on the same pixel).
+// The general pipeline (draws while a batch's specialized one compiles in the background) uses
+// draw_general.frag, the 1.0.7-beta1 shader with the SC_DYN switch, unchanged. Two Adreno 840
+// driver bugs (2026-11-15) keep them apart: SC_DYN combined with the other constants in one shader
+// gave striped cutscenes at x2 in the specialized pipelines; a constant-free build of this file as
+// the general pipeline drew battle models as noise.
 layout(constant_id = 0) const uint SC_TEX = 1u;     // any primitive of the batch textured
 layout(constant_id = 1) const uint SC_TFMT = 0u;
 layout(constant_id = 2) const uint SC_TFX = 0u;
@@ -33,10 +38,7 @@ layout(constant_id = 19) const uint SC_ZTE = 0u;
 layout(constant_id = 20) const uint SC_ZTST = 0u;
 layout(constant_id = 21) const uint SC_ZMSK = 0u;
 layout(constant_id = 22) const uint SC_ZFMT = 0u;
-// 1 (the default): every value from the constant buffer as before (the general pipeline that draws
-// while a batch's specialized one is compiled in the background); the specialized ones set 0
-layout(constant_id = 23) const uint SC_DYN = 1u;
-#define SPEC(sc, dyn) (SC_DYN != 0u ? (dyn) : (sc))
+#define SPEC(sc, dyn) (sc)
 layout(std140, set = 0, binding = 0) uniform CB {
     vec4 vp;   // surface width, height (native pixels), scale S
     uvec4 f0;  // fpsm kind (0 C32, 1 C24, 2 C16), fbmsk
@@ -58,7 +60,7 @@ layout(std140, set = 0, binding = 0) uniform CB {
     ivec4 dimx[4];
 };
 #define FPSM SPEC(SC_FPK, f0.x)
-#define FBMSK (SC_DYN == 0u && SC_FBMSK0 != 0u ? 0u : f0.y)
+#define FBMSK (SC_FBMSK0 != 0u ? 0u : f0.y)
 #define DTHE SPEC(SC_DTHE, f1.x)
 #define ZTE SPEC(SC_ZTE, f2.w)
 #define ZTST SPEC(SC_ZTST, f3.x)
@@ -66,7 +68,11 @@ layout(std140, set = 0, binding = 0) uniform CB {
 #define ZFMT SPEC(SC_ZFMT, f3.z)
 #define TFX SPEC(SC_TFX, f6.y)
 #define TCC SPEC(SC_TCC, f6.z)
-#define TFMT SPEC(SC_TFMT, f6.w)
+// the texture format is always a runtime switch (SC_TFMT unused): with texel() folded to one format
+// the Adreno 840 driver broke the bilinear reads of surface copies at internal x2 (striped cutscene
+// 053) and, with only format 0 left at runtime, battle models (noise); found 2026-11-15 with
+// GRANDIA_VK_SPEC_GEN and per-constant tests
+#define TFMT f6.w
 #define TW f7.x
 #define TH f7.y
 #define WMS SPEC(SC_WMS, f7.z)
@@ -85,15 +91,16 @@ layout(std140, set = 0, binding = 0) uniform CB {
 #define NEEDLOD SPEC(SC_NEEDLOD, f10.w)
 #define LODK f11.x
 #define QTHR f11.y
-#define TSCALE (SC_DYN == 0u && SC_TS1 != 0u ? 1.0 : f11.z)
+#define TSCALE (SC_TS1 != 0u ? 1.0 : f11.z)
 #define MIPL f14.x
 #define MMIN SPEC(SC_MMIN, f14.y)
 #define LCM SPEC(SC_LCM, f14.z)
 #define LODL f14.w
 #define HDTEX 0.0  // (no HD textures on Android)
 #define HDK f15.y
-#define FONTTEX (SC_DYN != 0u ? f15.z : (SC_FONT != 0u ? 1.0 : 0.0))
+#define FONTTEX (SC_FONT != 0u ? 1.0 : 0.0)
 #define FONTAMAX f15.w
+#define MIPON (SC_MIP != 0u)
 
 layout(set = 0, binding = 1) uniform usampler2D tex;
 layout(std430, set = 0, binding = 2) readonly buffer Clut { uint clut[512]; };
@@ -138,7 +145,7 @@ uvec2 PST;
 #define FGE ((PST.x >> 28) & 1u)
 #define IIP ((PST.x >> 29) & 1u)
 #define FST ((PST.x >> 30) & 1u)
-#define TME (SC_DYN != 0u || SC_TEX != 0u ? (PST.x >> 31) : 0u)
+#define TME (SC_TEX != 0u ? (PST.x >> 31) : 0u)
 #define BFIX (PST.y & 0xFFu)
 #define FOGCOL (PST.y >> 8)
 
@@ -297,7 +304,7 @@ void main() {
         ivec4 t;
         if (HDTEX != 0.0) t = sample_hd(u, v);
         else if (FONTTEX != 0.0) t = sample_font(u, v, (NEEDLOD != 0u) ? ((abs(i_stq.z) >= QTHR) ? -1.0 : 1.0) : LODK);
-        else if (SC_DYN != 0u ? MIPL != 0u : SC_MIP != 0u) t = ivec4(sample_mip(u, v, (FST != 0u) ? 1.0 : i_stq.z));
+        else if (MIPON) t = ivec4(sample_mip(u, v, (FST != 0u) ? 1.0 : i_stq.z));
         else {
             float lod = (NEEDLOD != 0u) ? ((abs(i_stq.z) >= QTHR) ? -1.0 : 1.0) : LODK;
             t = ivec4(sample_tex(u, v, lod));
