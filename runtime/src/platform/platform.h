@@ -45,6 +45,8 @@ struct Config {
     bool jp_voices = false;         // Japanese voices from the player's Japanese disc 1 (from the next start)
     int state_slot = 1;             // savestate slot for F5 (save) / F9 (load), 1..9 (0 = Auto: load only)
     bool autosave_state = true;     // savestate into slot Auto (0) a few seconds after every map change
+    int update_check = -1;          // at the start ask GitHub for a newer version: -1 = not asked yet, 0 = off, 1 = on
+    std::string update_skip;        // a version the player chose to skip
     int menu_size = 100;            // size of the F1 menu in percent (100..200; larger: it scrolls)
     int sharpen = 60;               // contrast adaptive sharpening of the output, 0 = off .. 100 (F4 toggles)
     bool show_fps = false;

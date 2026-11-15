@@ -210,9 +210,12 @@ void init(bool dump) {
     g_rep_dir = exe_dir() + "\\textures";
     g_dump_dir = exe_dir() + "\\texdump";
     g_dump = dump;
-    // translated labels (lang\<code>_tex) win over the HD textures; English keeps the originals
+    // translated labels (lang\<code>_tex) win over the HD textures; English keeps the originals.
+    // lang\all_tex: the port's own images for every language (the title screen's "Open Skies"); like
+    // the translated ones they win over the HD textures and stay when those are switched off.
     const std::string lang = platform::config().language;
     if (lang != "en") scan(widen(exe_dir() + "\\lang\\" + lang + "_tex"), 0, true);
+    scan(widen(exe_dir() + "\\lang\\all_tex"), 0, true);  // emplace keeps a translated image
     for (auto& [k, f] : g_files) g_lang.insert(k);
     scan(widen(g_rep_dir), 0, true);  // emplace keeps the translated images
     if (dump) {

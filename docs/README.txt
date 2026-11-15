@@ -32,6 +32,12 @@ name "Grandia III (USA) (Disc 1).iso". It is then found on its own and no file d
 Changing to disc 2 works as on the console: save at the end of disc 1, then choose "Change disc" in the
 F1 menu. The game restarts with disc 2 (it asks for that image once); load your save there.
 
+Updates: from v1.0.8 on, the game can look for a new version at the start (it asks once whether it may;
+only GitHub is contacted and nothing about you is sent). If there is one, a small window offers it:
+"Update now" downloads it, checks it and replaces the program files; settings, saves and savestates
+stay as they are. The replaced files are kept in "update_backup". Switch it off in the F1 menu
+("Check for updates at start").
+
 Saves go to the folder "memcards" (PS2 memory card files), savestates to "savestates".
 
 

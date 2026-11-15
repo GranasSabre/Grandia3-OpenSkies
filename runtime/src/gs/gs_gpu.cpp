@@ -987,7 +987,7 @@ static u32 g_ps0 = 0, g_ps1 = 0;  // per-primitive state of the current draw sta
 bool g_no_batch_join = false;     // --no-batch-join: a batch per draw state (A/B test of joining)
 bool g_frame_hashes = false;      // --frame-hashes: hash of every presented picture in the log (A/B tests)
 static bool g_cfg_mips = true;    // use the game's mip levels
-static bool g_bhud = false;       // batch of widescreen-corrected 2D elements
+static int g_bhud = 0;            // batch of widescreen-corrected 2D elements (hud_transform's result)
 static bool g_ball_sprites = true;            // batch consists of sprites only
 static std::vector<PixRect> g_bsprites;       // their exact pixel rectangles
 static int g_bprims = 0;
@@ -1665,7 +1665,8 @@ static void hud_frame_end() {
         if (s.width > 0 && s.x0 <= 4 * 16 && s.x1 >= (s.width - 4) * 16) g_hud_fullwidth.insert(k);
     g_hud_span.clear();
 }
-static bool hud_transform(const DrawState& ds, int prim, const Vertex* v, Vertex* out) {
+// returns 0 = not narrowed, 1 = narrowed, 2 = narrowed with the edges pinned to the frame edges
+static int hud_transform(const DrawState& ds, int prim, const Vertex* v, Vertex* out) {
     const platform::Config& cfg = platform::config();
     if (!cfg.widescreen_hack || !cfg.hud_fix) return false;
     if (ds.fbp != g_display_fbp[0] && ds.fbp != g_display_fbp[1]) return false;
@@ -1710,7 +1711,7 @@ static bool hud_transform(const DrawState& ds, int prim, const Vertex* v, Vertex
         out[i].x = cx + (int)lrintf((v[i].x - cx) * hf);
     }
     st_hud++;
-    return true;
+    return pin_edges ? 2 : 1;
 }
 
 // State the shader reads per primitive (vertex STATE, PST in the shader): primitives that differ only in
@@ -1739,7 +1740,7 @@ static bool prim_overwrites(const DrawState& ds) {
 void on_draw(const DrawState& ds, u32 state_id, int prim, const Vertex* vin) {
     st_draws++;
     Vertex hv[3];
-    bool hud = hud_transform(ds, prim, vin, hv);
+    int hud = hud_transform(ds, prim, vin, hv);
     const Vertex* v = hud ? hv : vin;
     if (state_id != g_bid && g_bvalid && !g_verts.empty() && !g_bself && hud == g_bhud && !(ds.tme && g_bself_tex) &&
         !g_no_batch_join && same_batch_state(g_prev_raw, ds)) {
@@ -1781,9 +1782,13 @@ void on_draw(const DrawState& ds, u32 state_id, int prim, const Vertex* vin) {
         g_bds = ds;
         g_bhud = hud;
         if (hud) {
-            // the scissor of a narrowed element (text boxes clip their contents) narrows with it
+            // the scissor of a narrowed element (text boxes clip their contents) narrows with it. A full
+            // width scissor too: the 4:3 picture's edges are where the PS2 screen ended, and menus park
+            // windows beyond them (the options menu's side window showed at the right edge). Not for
+            // layers pinned to the frame edges, which must reach them, and not with the large dialogue
+            // windows (msg_window.cpp lets them reach beyond the 4:3 picture).
             int width = (int)ds.fbw * 64, cx = width / 2;
-            if (ds.scax0 > 0 || ds.scax1 < width - 1) {
+            if ((hud == 1 && !platform::big_text_active()) || ds.scax0 > 0 || ds.scax1 < width - 1) {
                 float hf = platform::hud_factor();
                 g_bds.scax0 = (int)floorf(cx + (ds.scax0 - cx) * hf);
                 g_bds.scax1 = (int)ceilf(cx + (ds.scax1 + 1 - cx) * hf) - 1;

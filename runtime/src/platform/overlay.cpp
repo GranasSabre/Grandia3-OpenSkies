@@ -149,6 +149,8 @@ void build_items() {
                            c.language = l[(i + (dir < 0 ? l.size() - 1 : 1)) % l.size()];
                            g_note = L"Die Spieltexte wechseln beim nächsten Start.";
                        }});
+    g_items.push_back({L"Beim Start nach Updates suchen", [&c] { return onoff(c.update_check == 1); },
+                       [&c](int) { c.update_check = c.update_check == 1 ? 0 : 1; }});
     g_items.push_back({L"Größe dieses Menüs", [&c] { return std::to_wstring(clampi(c.menu_size, 100, 200)) + L" %"; },
                        [&c](int dir) { c.menu_size = clampi(c.menu_size, 100, 200) + (dir < 0 ? -25 : 25); if (c.menu_size > 200) c.menu_size = 100; if (c.menu_size < 100) c.menu_size = 200; }});
     g_items.push_back({L"Disc wechseln (Neustart)", [&c] {

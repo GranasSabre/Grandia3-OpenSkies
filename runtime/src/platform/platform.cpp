@@ -216,6 +216,8 @@ void load_config(const std::string& path) {
         else if (k == "jp_voices") g_cfg.jp_voices = iv != 0;
         else if (k == "state_slot") g_cfg.state_slot = iv < 0 ? 1 : iv > 9 ? 9 : iv;
         else if (k == "autosave_state") g_cfg.autosave_state = iv != 0;
+        else if (k == "update_check") g_cfg.update_check = iv < 0 ? -1 : iv != 0;
+        else if (k == "update_skip") g_cfg.update_skip = v;
         else if (k == "menu_size") g_cfg.menu_size = iv < 100 ? 100 : iv > 200 ? 200 : iv;
         else if (k == "gs_thread") g_cfg.gs_thread = iv != 0;
         else if (k == "language") { g_cfg.language = v; for (char& ch : g_cfg.language) ch = (char)tolower((unsigned char)ch); }
@@ -291,6 +293,7 @@ void save_config() {
                "jp_voices = %d\n", g_cfg.jp_voices);
     fprintf(f, "; savestate slot used by F5 (save) and F9 (load); 0 = Auto (load only)\nstate_slot = %d\n", g_cfg.state_slot);
     fprintf(f, "; 1 = savestate into slot Auto (savestates\\slot0.g3s) a few seconds after every map change\nautosave_state = %d\n", g_cfg.autosave_state);
+    fprintf(f, "; 1 = at the start ask GitHub whether a newer version exists (only GitHub is contacted), 0 = never\n; update_skip: a version not to offer again\nupdate_check = %d\nupdate_skip = %s\n", g_cfg.update_check, g_cfg.update_skip.c_str());
     fprintf(f, "; size of the F1 menu in percent (100 .. 200; a larger menu scrolls)\nmenu_size = %d\n", g_cfg.menu_size);
     fprintf(f, "integer_scaling = %d\n", g_cfg.integer_scaling);
     fprintf(f, "show_fps = %d\n", g_cfg.show_fps);

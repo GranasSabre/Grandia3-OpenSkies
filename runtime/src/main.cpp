@@ -1,4 +1,8 @@
 // Grandia III native port - entry point.
+#include "version.h"
+#ifdef _WIN32
+#include "platform/updater.h"
+#endif
 #include "common.h"
 #include "savestate.h"
 #include <thread>
@@ -304,6 +308,11 @@ int main(int argc, char** argv) {
     platform::init_console(cfg.console);
     g_logfile = fopen((dir + "\\grandia3.log").c_str(), "w");
     log_write(LOG_MAIN, "Steam Deck: %s", platform::steam_deck_info().c_str());
+    log_write(LOG_MAIN, "Grandia III: Open Skies v%s", G3_VERSION);
+    // a newer release on GitHub? (asks once at the first start; the update window may restart the game)
+#ifdef _WIN32
+    if (updater::run_at_start(argc, argv)) return 0;
+#endif
 
     // the game data: the player's own disc image (iso_path / iso_path2, chosen at the first start) or
     // an unpacked disc (data\disc.idx next to the executable; disc 2: data\disc2.idx)

@@ -32,7 +32,7 @@ def main():
     if debug:
         cxx_flags += ' -DGR3_DEBUG=1'
     ldflags = ('-static -mwindows' if not debug else '-static') + f' -Wl,-Map={bdir}/Grandia3.map'
-    libs = '-ld3d11 -ldxgi -ld3dcompiler -lxinput1_4 -lole32 -lwinmm -luser32 -lgdi32 -lshell32 -lavrt -lksuser -luuid -lcomctl32 -lwindowscodecs -lcomdlg32'
+    libs = '-ld3d11 -ldxgi -ld3dcompiler -lxinput1_4 -lole32 -lwinmm -luser32 -lgdi32 -lshell32 -lavrt -lksuser -luuid -lcomctl32 -lwindowscodecs -lcomdlg32 -lwinhttp -lbcrypt -ldwmapi'
     lines = [
         f'builddir = {bdir}',
         f'cc = {os.path.join(TC, "clang.exe")}',
@@ -97,7 +97,7 @@ def main():
         obj = f'{bdir}/gen/vu/' + os.path.basename(rel).replace('.cpp', '.o')
         lines.append(f'build {obj}: cxx {rel}')
         objs_rt.append(obj)
-    lines.append(f'build {bdir}/rt/grandia3_res.o: rc runtime/res/grandia3.rc | runtime/res/grandia3.manifest runtime/res/grandia3.ico')
+    lines.append(f'build {bdir}/rt/grandia3_res.o: rc runtime/res/grandia3.rc | runtime/res/grandia3.manifest runtime/res/grandia3.ico runtime/res/updater.jpg runtime/src/version.h')
     objs_rt.append(f'{bdir}/rt/grandia3_res.o')
     lines.append(f'build {bdir}/libgen.a: ar ' + ' '.join(objs_gen))
     exe = f'{bdir}/Grandia3.exe'

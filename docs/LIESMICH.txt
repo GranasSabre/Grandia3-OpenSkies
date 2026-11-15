@@ -32,6 +32,12 @@ Dateidialog.
 Disc 2 wie auf der Konsole: am Ende von Disc 1 speichern, im F1-Menü "Disc wechseln" wählen. Das Spiel
 startet mit Disc 2 neu (fragt einmal nach deren Abbild); dort den Spielstand laden.
 
+Updates: Ab v1.0.8 kann das Spiel beim Start nach einer neuen Version suchen (es fragt einmal, ob es
+darf; gefragt wird nur GitHub, über dich wird nichts gesendet). Gibt es eine, bietet ein kleines Fenster
+sie an: "Jetzt aktualisieren" lädt sie herunter, prüft sie und tauscht die Programmdateien aus;
+Einstellungen, Spielstände und Savestates bleiben, wie sie sind. Die ersetzten Dateien liegen danach in
+"update_backup". Abschalten im F1-Menü ("Beim Start nach Updates suchen").
+
 Spielstände liegen im Ordner "memcards" (PS2-Speicherkarten), Savestates in "savestates".
 
 
