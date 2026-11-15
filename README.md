@@ -108,35 +108,6 @@ The game writes `grandia3.log` next to itself. Please attach it when you report 
 [Issues](../../issues). Feedback on the subtitles (timing, wrong or missing lines) and the translations
 is welcome too.
 
-## How it works (short)
-
-A PS2 game is a program for the PS2's processors. Here that program - together with the game's sound
-driver and its 3D geometry programs - was translated into C++ code by tools in this repository, and that
-code is compiled into a normal Windows program. A small runtime takes the place of the PS2 hardware the
-game talks to: it draws the pictures with Direct3D 11, plays the sound, and reads the discs. Because the
-code is generated from your own disc, this repository contains no game code at all.
-
-## Building from source
-
-For developers; players only need the download above.
-
-1. Toolchain: [LLVM-MinGW](https://github.com/mstorsjo/llvm-mingw/releases) (`llvm-mingw-*-ucrt-x86_64`)
-   and [Ninja](https://github.com/ninja-build/ninja/releases), unpacked into `toolchain/` (paths at the
-   top of `build.py`), and Python 3.
-2. Extract disc 1: `python tools/iso_extract.py "Grandia III (USA) (Disc 1).iso" extract extracted/disc1`
-3. Generate the game code: `python tools/gen_all.py extracted/disc1 generated` and
-   `python tools/iop_recomp.py extracted/disc1/GS_IOP.IRX 0x00040000 generated/iop gsiop`
-4. Build: `python build.py` (result: `build/release/Grandia3.exe`)
-5. The 3D geometry programs: a build without their translation runs them in an interpreter and saves
-   them into `vu_new/`; `python tools/vu_recomp.py vu_new/vu1img_<hash>.bin generated/vu/vu1_<hash>.cpp`
-   and a rebuild add the translation.
-
-Switches for testing and development are listed in `runtime/src/main.cpp`.
-
-Android: steps 2, 3 and 5 as above, then `python tools/build_android.py` (needs JDK 17, Android SDK
-platform 35, build-tools 35.0.1 and NDK r29 in `toolchain/`; Windows host). The Android runtime is in
-`runtime/android/`; notes on its Vulkan renderer in `docs/ANDROID_VULKAN_RENDERER.md`.
-
 ## License
 
 The code in this repository (the translation tools and the runtime) is under the MIT license - see
