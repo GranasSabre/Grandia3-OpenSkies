@@ -29,6 +29,9 @@ struct Config {
     bool remove_letterbox = false;
     bool vibration = true;          // controller rumble
     bool camera_invert_x = false;   // right stick left/right reversed (field camera turns the other way)
+    bool touch_autohide = true;     // Android: the touch controls fade out after a few seconds without a touch
+    int touch_cam_speed = 7;        // Android: camera swipe speed 1..15
+    bool touch_dpad = false;        // Android: d-pad in the touch controls
     int disc = 1;                   // which disc is "inserted" (1 or 2); switching restarts the game
     bool lod_scale = true;          // GPU renderer: texture detail level follows the internal resolution
     bool hud_fix = true;            // widescreen: 2D elements keep their 4:3 proportions (GPU renderer)  // no black bars in cutscenes and battles (PCSX2 patch, marked "may cause error")
@@ -42,11 +45,15 @@ struct Config {
     bool cutscene_skip = true;      // START skips in-engine cutscenes (fast invisible run)
     bool subtitles = true;          // subtitles for voiced cutscenes (lang\sub_<language>.tsv)
     bool contact_battles = true;    // touching a monster in the field starts a battle (off: walk past them)
+    int exp_mult = 1;               // battle reward EXP x1..x4 (ee/reward_hooks.cpp)
+    int gold_mult = 1;              // battle reward gold x1..x4
     bool jp_voices = false;         // Japanese voices from the player's Japanese disc 1 (from the next start)
     int state_slot = 1;             // savestate slot for F5 (save) / F9 (load), 1..9 (0 = Auto: load only)
     bool autosave_state = true;     // savestate into slot Auto (0) a few seconds after every map change
     int update_check = -1;          // at the start ask GitHub for a newer version: -1 = not asked yet, 0 = off, 1 = on
     std::string update_skip;        // a version the player chose to skip
+    bool update_autoplay = false;   // update window: when up to date, start the game after 3 s without a click
+    int cam_speed = 100;            // PC: field camera turn speed in percent (100..300)
     int menu_size = 100;            // size of the F1 menu in percent (100..200; larger: it scrolls)
     int sharpen = 60;               // contrast adaptive sharpening of the output, 0 = off .. 100 (F4 toggles)
     bool show_fps = false;
@@ -85,6 +92,7 @@ std::string steam_deck_info();
 extern bool g_force_steam_deck;  // --steamdeck
 bool big_text_active();   // option big_text in effect (needs widescreen)
 float text_scale();       // conversation window scale in effect (1 when off)
+float camera_boost();     // field camera turn speed factor (Android: fast swipes; 1 = the game's own)
 void apply_patches();     // optional game code patches from the settings (widescreen 16:9 / 16:10)
 float view_aspect();      // aspect ratio of the widescreen 3D view (16:9, 16:10 or the window's)
 float hud_factor();       // widescreen with 4:3 menus: horizontal factor of 2D elements (3/4, 5/6 for 16:10)

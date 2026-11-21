@@ -36,7 +36,9 @@ Updates: Ab v1.0.8 kann das Spiel beim Start nach einer neuen Version suchen (es
 darf; gefragt wird nur GitHub, über dich wird nichts gesendet). Gibt es eine, bietet ein kleines Fenster
 sie an: "Jetzt aktualisieren" lädt sie herunter, prüft sie und tauscht die Programmdateien aus;
 Einstellungen, Spielstände und Savestates bleiben, wie sie sind. Die ersetzten Dateien liegen danach in
-"update_backup". Abschalten im F1-Menü ("Beim Start nach Updates suchen").
+"update_backup". Gibt es keine, sagt das Fenster das; dann auf "Spielen" klicken (oder den Haken
+"Ohne Klick starten, wenn alles aktuell ist" setzen). Abschalten im F1-Menü ("Beim Start nach Updates
+suchen").
 
 Spielstände liegen im Ordner "memcards" (PS2-Speicherkarten), Savestates in "savestates".
 

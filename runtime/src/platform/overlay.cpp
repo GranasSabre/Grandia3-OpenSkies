@@ -104,6 +104,12 @@ void build_items() {
     g_items.push_back({L"Zwischensequenzen mit START überspringen", [&c] { return onoff(c.cutscene_skip); }, toggle(c.cutscene_skip)});
     g_items.push_back({L"Untertitel in Zwischensequenzen", [&c] { return onoff(c.subtitles); }, toggle(c.subtitles)});
     g_items.push_back({L"Kämpfe bei Gegnerkontakt", [&c] { return onoff(c.contact_battles); }, toggle(c.contact_battles)});
+    g_items.push_back({L"EXP aus Kämpfen", [&c] { return L"x" + std::to_wstring(c.exp_mult); },
+                       [&c](int dir) { c.exp_mult = (c.exp_mult - 1 + (dir < 0 ? 3 : 1)) % 4 + 1; }});
+    g_items.push_back({L"Gold aus Kämpfen", [&c] { return L"x" + std::to_wstring(c.gold_mult); },
+                       [&c](int dir) { c.gold_mult = (c.gold_mult - 1 + (dir < 0 ? 3 : 1)) % 4 + 1; }});
+    g_items.push_back({L"Kamera-Drehtempo", [&c] { return std::to_wstring(clampi(c.cam_speed, 100, 300)) + L" %"; },
+                       [&c](int dir) { c.cam_speed = clampi(c.cam_speed, 100, 300) + (dir < 0 ? -25 : 25); if (c.cam_speed > 300) c.cam_speed = 100; if (c.cam_speed < 100) c.cam_speed = 300; }});
     g_items.push_back({L"Undub: japanische Stimmen (ab Neustart)", [&c] { return onoff(c.jp_voices); }, toggle(c.jp_voices)});
     g_items.push_back({L"Filme mit START überspringen", [&c] { return onoff(c.movie_skip); },
                        toggle(c.movie_skip, [&c] { g_ee_patch[3] = c.movie_skip; })});

@@ -93,10 +93,12 @@
    "0x002615F0": "hook_scene_skip_enabled",
    "0x002A11F0": "hook_msg_window",
    "0x002A0400": "hook_msg_text",
-   "0x0027A270": "hook_glyph_quad"
+   "0x0027A270": "hook_glyph_quad",
+   "0x0029ADB0": "hook_field_camera"
   },
   "battle": {
-   "0x0032B900": "hook_battle_msg_draw"
+   "0x0032B900": "hook_battle_msg_draw",
+   "0x003054D0": "hook_battle_reward"
   }
  }
 }

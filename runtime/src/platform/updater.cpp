@@ -683,7 +683,7 @@ static bool fetch_release(const std::wstring& api, Release& rel, std::wstring& e
 // the window
 // ---------------------------------------------------------------------------------------------------
 enum State { OFFER, DOWNLOADING, INSTALLING, DONE, FAILED, CHECKING, LATEST, OFFLINE };
-enum Id { NONE, BTN_UPDATE, BTN_LATER, BTN_SKIP, BTN_PAGE, BTN_CANCEL, LINK_NOTES, CHECKBOX, BTN_PLAY };
+enum Id { NONE, BTN_UPDATE, BTN_LATER, BTN_SKIP, BTN_PAGE, BTN_CANCEL, LINK_NOTES, CHECKBOX, BTN_PLAY, CHECK_AUTO };
 static const int LW = 380, LH = 740;  // logical client size
 static const COLORREF BG = RGB(12, 22, 52);
 
@@ -703,6 +703,7 @@ struct Ui {
     std::string old_version = G3_VERSION;
     int hover = NONE, press = NONE;
     bool check = true;
+    bool autoplay = false;           // update_autoplay: when up to date, the game starts after 3 s on its own
     int result = 0;  // 0 = play on, 1 = updated (restart)
     float s = 1;     // DPI scale
     int w = 0, h = 0;
@@ -866,6 +867,10 @@ static void paint(Ui& u, HDC target) {
         std::wstring play = tr(L"Spielen");
         if (u.countdown > 0) play += L"  (" + std::to_wstring(u.countdown) + L")";
         button(BTN_PLAY, 588, 44, play, true);
+        RECT ar = R(32, 682, LW - 64, 20);
+        std::wstring al = std::wstring(u.autoplay ? L"☑  " : L"☐  ") + tr(L"Ohne Klick starten, wenn alles aktuell ist");
+        texts.push_back({al, ar, f_check, u.hover == CHECK_AUTO ? RGB(236, 240, 252) : RGB(150, 170, 215), DT_CENTER | DT_VCENTER | DT_SINGLELINE});
+        u.hits.push_back({ar, CHECK_AUTO});
         RECT cr = R(32, 710, LW - 64, 20);
         std::wstring cl = std::wstring(u.check ? L"☑  " : L"☐  ") + tr(L"Beim Start nach Updates suchen");
         texts.push_back({cl, cr, f_check, u.hover == CHECKBOX ? RGB(236, 240, 252) : RGB(150, 170, 215), DT_CENTER | DT_VCENTER | DT_SINGLELINE});
@@ -958,6 +963,15 @@ static void click(Ui& u, int id) {
             platform::config().update_check = u.check ? 1 : 0;
             platform::save_config();
             break;
+        case CHECK_AUTO:
+            u.autoplay = !u.autoplay;
+            platform::config().update_autoplay = u.autoplay;
+            platform::save_config();
+            if (u.hwnd && (u.state == LATEST || u.state == OFFLINE)) {
+                if (u.autoplay) { u.countdown = 3; SetTimer(u.hwnd, 2, 1000, nullptr); }  // ticked: off it goes
+                else { u.countdown = 0; KillTimer(u.hwnd, 2); }
+            }
+            break;
     }
     if (u.hwnd) InvalidateRect(u.hwnd, nullptr, FALSE);
 }
@@ -1009,8 +1023,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             if (g_auto) {
                 if (u->state == OFFER) start_download(*u);
                 else u->done = true;
-            } else if (u->state != OFFER) {
-                u->countdown = 3;  // the game starts on its own
+            } else if (u->state != OFFER && u->autoplay) {
+                u->countdown = 3;  // the game starts on its own (only when the player ticked it)
                 SetTimer(h, 2, 1000, nullptr);
             }
             InvalidateRect(h, nullptr, FALSE);
@@ -1160,6 +1174,7 @@ static bool run_inner(int argc, char** argv) {
     u.api = api;
     u.skip = cfg.update_skip;
     u.check = cfg.update_check == 1;
+    u.autoplay = cfg.update_autoplay;
     if (show_window(u, auto_click, auto_click) != 1) return false;
     // start the new version with the same arguments
     std::wstring exe = u.new_exe.empty() ? exe_dir_w() + L"\\" + exe_name_w() : u.new_exe;

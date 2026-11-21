@@ -152,6 +152,8 @@ bool big_text_active() {
     return g_cfg.widescreen_hack && (g_cfg.big_text == 1 || (g_cfg.big_text < 0 && is_steam_deck()));
 }
 
+float camera_boost() { int v = g_cfg.cam_speed < 100 ? 100 : (g_cfg.cam_speed > 300 ? 300 : g_cfg.cam_speed); return v / 100.0f; }  // PC: setting "camera turn speed"
+
 float text_scale() {
     if (!big_text_active()) return 1.0f;
     float k = g_cfg.text_scale;
@@ -213,11 +215,15 @@ void load_config(const std::string& path) {
         else if (k == "cutscene_skip") g_cfg.cutscene_skip = iv != 0;
         else if (k == "subtitles") g_cfg.subtitles = iv != 0;
         else if (k == "contact_battles") g_cfg.contact_battles = iv != 0;
+        else if (k == "exp_mult") g_cfg.exp_mult = iv < 1 ? 1 : (iv > 4 ? 4 : iv);
+        else if (k == "gold_mult") g_cfg.gold_mult = iv < 1 ? 1 : (iv > 4 ? 4 : iv);
         else if (k == "jp_voices") g_cfg.jp_voices = iv != 0;
         else if (k == "state_slot") g_cfg.state_slot = iv < 0 ? 1 : iv > 9 ? 9 : iv;
         else if (k == "autosave_state") g_cfg.autosave_state = iv != 0;
         else if (k == "update_check") g_cfg.update_check = iv < 0 ? -1 : iv != 0;
         else if (k == "update_skip") g_cfg.update_skip = v;
+        else if (k == "update_autoplay") g_cfg.update_autoplay = iv != 0;
+        else if (k == "cam_speed") g_cfg.cam_speed = iv < 100 ? 100 : (iv > 300 ? 300 : iv);
         else if (k == "menu_size") g_cfg.menu_size = iv < 100 ? 100 : iv > 200 ? 200 : iv;
         else if (k == "gs_thread") g_cfg.gs_thread = iv != 0;
         else if (k == "language") { g_cfg.language = v; for (char& ch : g_cfg.language) ch = (char)tolower((unsigned char)ch); }
@@ -288,12 +294,15 @@ void save_config() {
     fprintf(f, "; START skips cutscenes (they run invisibly at high speed until they end)\ncutscene_skip = %d\n", g_cfg.cutscene_skip);
     fprintf(f, "; subtitles for voiced cutscenes (lang\\sub_<language>.tsv)\nsubtitles = %d\n", g_cfg.subtitles);
     fprintf(f, "; 0 = touching a monster in the field starts no battle (story battles still happen)\ncontact_battles = %d\n", g_cfg.contact_battles);
+    fprintf(f, "; battle rewards multiplied (1-4)\nexp_mult = %d\ngold_mult = %d\n", g_cfg.exp_mult, g_cfg.gold_mult);
     fprintf(f, "; Undub: Japanese voices (cutscenes, battles, movies) from your own Grandia III (Japan) disc 1 image:\n"
                "; iso_path_jp in [Paths], or disc1_jp.iso / \"Grandia III (Japan) (Disc 1).iso\" next to the game or the US image\n"
                "jp_voices = %d\n", g_cfg.jp_voices);
     fprintf(f, "; savestate slot used by F5 (save) and F9 (load); 0 = Auto (load only)\nstate_slot = %d\n", g_cfg.state_slot);
     fprintf(f, "; 1 = savestate into slot Auto (savestates\\slot0.g3s) a few seconds after every map change\nautosave_state = %d\n", g_cfg.autosave_state);
     fprintf(f, "; 1 = at the start ask GitHub whether a newer version exists (only GitHub is contacted), 0 = never\n; update_skip: a version not to offer again\nupdate_check = %d\nupdate_skip = %s\n", g_cfg.update_check, g_cfg.update_skip.c_str());
+    fprintf(f, "; 1 = the update window starts the game after 3 s on its own when there is no update\nupdate_autoplay = %d\n", g_cfg.update_autoplay ? 1 : 0);
+    fprintf(f, "; field camera turn speed in percent (100 = the game's own, up to 300)\ncam_speed = %d\n", g_cfg.cam_speed);
     fprintf(f, "; size of the F1 menu in percent (100 .. 200; a larger menu scrolls)\nmenu_size = %d\n", g_cfg.menu_size);
     fprintf(f, "integer_scaling = %d\n", g_cfg.integer_scaling);
     fprintf(f, "show_fps = %d\n", g_cfg.show_fps);
