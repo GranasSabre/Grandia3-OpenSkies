@@ -11,6 +11,7 @@
 #include "ee/kernel.h"
 #include "savestate.h"
 #include "touch_android.h"
+#include "memory.h"
 #include "vk_ctx.h"
 #include <android/asset_manager.h>
 #include <android/log.h>
@@ -125,6 +126,8 @@ float view_aspect() {
 }
 float hud_factor() { return 4.0f / 3.0f / view_aspect(); }
 bool big_text_active() { return g_cfg.widescreen_hack && g_cfg.big_text == 1; }
+float camera_boost() { return touch::camera_boost(); }
+
 float text_scale() {
     if (!big_text_active()) return 1.0f;
     return std::clamp(g_cfg.text_scale, 1.0f, 1.6f);
@@ -167,6 +170,8 @@ void load_config(const std::string& path) {
         else if (k == "state_slot") g_cfg.state_slot = std::clamp(iv, 0, 9);
         else if (k == "autosave_state") g_cfg.autosave_state = iv != 0;
         else if (k == "contact_battles") g_cfg.contact_battles = iv != 0;
+        else if (k == "exp_mult") g_cfg.exp_mult = std::clamp(iv, 1, 4);
+        else if (k == "gold_mult") g_cfg.gold_mult = std::clamp(iv, 1, 4);
         else if (k == "jp_voices") g_cfg.jp_voices = iv != 0;
         else if (k == "iso_path_jp") g_cfg.iso_path_jp = v;
         else if (k == "gs_thread") g_cfg.gs_thread = iv != 0;
@@ -183,6 +188,9 @@ void load_config(const std::string& path) {
         else if (k == "iso_path2") g_cfg.iso_path2 = v;
         else if (k == "disc") g_cfg.disc = iv == 2 ? 2 : 1;
         else if (k == "camera_invert_x") g_cfg.camera_invert_x = iv != 0;
+        else if (k == "touch_autohide") g_cfg.touch_autohide = iv != 0;
+        else if (k == "touch_cam_speed") g_cfg.touch_cam_speed = std::clamp(iv, 1, 15);
+        else if (k == "touch_dpad") g_cfg.touch_dpad = iv != 0;
         else if (k == "hud_fix") g_cfg.hud_fix = iv != 0;
         else if (k == "big_text") g_cfg.big_text = iv < 0 ? -1 : (iv ? 1 : 0);
         else if (k == "text_scale") g_cfg.text_scale = std::clamp((float)atof(v.c_str()), 1.0f, 1.6f);
@@ -191,6 +199,9 @@ void load_config(const std::string& path) {
         else if (k == "sharp_text") g_cfg.sharp_text = iv != 0;
     }
     fclose(f);
+    touch::set_autohide(g_cfg.touch_autohide);
+    touch::set_camera_speed(g_cfg.touch_cam_speed);
+    touch::set_dpad(g_cfg.touch_dpad);
 }
 
 void save_config() {
@@ -211,9 +222,14 @@ void save_config() {
     fprintf(f, "\n[Audio]\nenabled = %d\nvolume = %d\nvolume_music = %d\nvolume_voice = %d\nvolume_sfx = %d\nvolume_movie = %d\n",
             g_cfg.audio_enabled, g_cfg.volume, g_cfg.vol_music, g_cfg.vol_voice, g_cfg.vol_sfx, g_cfg.vol_movie);
     fprintf(f, "autosave_state = %d\ncontact_battles = %d\njp_voices = %d\n", g_cfg.autosave_state, g_cfg.contact_battles, g_cfg.jp_voices);
+    fprintf(f, "; battle rewards multiplied (1-4)\nexp_mult = %d\ngold_mult = %d\n", g_cfg.exp_mult, g_cfg.gold_mult);
     fprintf(f, "\n[Paths]\niso_path = %s\niso_path2 = %s\niso_path_jp = %s\ndisc = %d\n", g_cfg.iso_path.c_str(), g_cfg.iso_path2.c_str(),
             g_cfg.iso_path_jp.c_str(), g_cfg.disc);
     fprintf(f, "\n[Input]\ncamera_invert_x = %d\n", g_cfg.camera_invert_x);
+    fprintf(f, "; 1 = the touch controls fade out after a few seconds without a touch (always hidden with a controller)\n");
+    fprintf(f, "touch_autohide = %d\n", g_cfg.touch_autohide);
+    fprintf(f, "; camera swipe speed 1-15; 1 = d-pad in the touch controls\ntouch_cam_speed = %d\ntouch_dpad = %d\n", g_cfg.touch_cam_speed,
+            g_cfg.touch_dpad);
     fclose(f);
 }
 
@@ -622,6 +638,18 @@ PadState read_pad(int port) {
     PadState s{};
     s.lx = s.ly = s.rx = s.ry = 0x80;
     if (port != 0) return s;
+    if (!g_ram_dump_at.empty() && host_time_sec() >= g_ram_dump_at.front()) {
+        // --ramdump=SEC[,SEC...]: EE main memory snapshots next to the ini (analysis, as on the PC)
+        char name[64];
+        snprintf(name, sizeof name, "/ram_%03d.bin", (int)g_ram_dump_at.front());
+        std::string d = g_cfg_path.substr(0, g_cfg_path.find_last_of("/\\"));
+        if (FILE* f = fopen((d + name).c_str(), "wb")) {
+            fwrite(mem::ram, 1, 32u << 20, f);
+            fclose(f);
+            log_write(LOG_MAIN, "ram dump %s", name);
+        }
+        g_ram_dump_at.erase(g_ram_dump_at.begin());
+    }
     u16 b = (u16)(g_btn.load(std::memory_order_relaxed) | touch::buttons());
     if (g_hat_x < 0) b |= 0x0080;
     if (g_hat_x > 0) b |= 0x0020;
@@ -639,6 +667,8 @@ PadState read_pad(int port) {
     if (touch::stick(&tx, &ty)) s.lx = ax(tx), s.ly = ax(ty);
     s.rx = ax(g_axis[2]);
     s.ry = ax(g_axis[3]);
+    int crx;
+    if (touch::camera(&crx) && crx) s.rx = ax(crx);  // swipe on the screen: camera
     u32 auto_stick = 0;
     double now = host_time_sec();
     for (auto& a : g_autopress)

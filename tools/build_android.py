@@ -58,7 +58,8 @@ def build_shaders(bdir):
     variants = [(s, 'SPV_' + os.path.basename(s).replace('.', '_').upper(), []) for s in srcs]
     for s in srcs:
         if os.path.basename(s) == 'draw.frag':
-            variants += [(s, 'SPV_DRAW_Z_FRAG', ['-DHAS_Z=1'])]
+            variants += [(s, 'SPV_DRAW_Z_FRAG', ['-DHAS_Z=1']), (s, 'SPV_DRAW_HW_FRAG', ['-DHW']),
+                         (s, 'SPV_DRAW_HW_Z_FRAG', ['-DHW', '-DHAS_Z=1'])]
         if os.path.basename(s) == 'draw_general.frag':
             variants += [(s, 'SPV_DRAW_GENERAL_Z_FRAG', ['-DHAS_Z=1'])]
     # G3_DRAW_DEFS: extra defines for the draw shader (experiments)

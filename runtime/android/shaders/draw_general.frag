@@ -4,12 +4,18 @@
 // access): subpassLoad reads the pixel as earlier primitives left it. Both outputs are always
 // written (the old value where nothing changes); discard keeps both.
 // Built twice: HAS_Z 0 (frame surface only) and 1 (frame + z surface).
-// THE GENERAL PIPELINE ONLY: the 1.0.7-beta1 draw.frag, kept unchanged because the driver compiles it
-// correctly (see draw.frag); its constants keep their defaults (SC_DYN 1: all values from the CB).
+// THE GENERAL PIPELINE ONLY: the 1.0.7-beta1 draw.frag (the driver compiles it correctly, see
+// draw.frag), changed only for the RGBA8 colour view and the depth mirror (2026-11-16); its constants
+// keep their defaults (SC_DYN 1: all values from the CB).
 // Changes to the pixel pipeline go into both files.
 #ifndef HAS_Z
 #define HAS_Z 0
 #endif
+// the frame surface is bound through its RGBA8 view (the same bits as the R32 value: R in the low
+// byte), so hardware blending works on it (HW build); packUnorm4x8/unpackUnorm4x8 are exact.
+// Passes with a z surface also have a depth attachment that mirrors it: every pipeline writes
+// gl_FragDepth = ZD(the z value the pixel ends with) (the HW build tests against it).
+#define ZD(z) (float(z) * (1.0 / 4294967296.0))
 // Per batch the renderer builds a pipeline with these fixed (gs_vk.cpp draw_spec): the branches on
 // them fold away, which shortens the shader a lot (with rasterization order access the latency of
 // one fragment holds up the next one on the same pixel).
@@ -107,7 +113,7 @@ layout(set = 0, binding = 6) uniform usampler2D texm4;
 layout(set = 0, binding = 7) uniform usampler2D texm5;
 layout(set = 0, binding = 8) uniform usampler2D texm6;
 layout(set = 0, binding = 9) uniform sampler2D hdtex;   // HD replacement (sampler chosen per batch)
-layout(input_attachment_index = 0, set = 0, binding = 10) uniform usubpassInput fb_in;
+layout(input_attachment_index = 0, set = 0, binding = 10) uniform subpassInput fb_in;
 #if HAS_Z
 layout(input_attachment_index = 1, set = 0, binding = 11) uniform usubpassInput zb_in;
 #endif
@@ -118,7 +124,7 @@ layout(location = 2) noperspective in vec3 i_stq;
 layout(location = 3) noperspective in float i_z;
 layout(location = 4) noperspective in float i_fog;
 layout(location = 5) flat in uvec2 i_st;
-layout(location = 0) out uint fb_out;
+layout(location = 0) out vec4 fb_out;
 #if HAS_Z
 layout(location = 1) out uint zb_out;
 #endif
@@ -280,11 +286,12 @@ void main() {
     PST = i_st;
     ivec2 P = ivec2(gl_FragCoord.xy);
     int S = int(vp.z);
-    uint raw = subpassLoad(fb_in).x;
-    fb_out = raw;
+    uint raw = packUnorm4x8(subpassLoad(fb_in));
+    fb_out = unpackUnorm4x8(raw);
 #if HAS_Z
     uint zraw = subpassLoad(zb_in).x;
     zb_out = zraw;
+    gl_FragDepth = ZD(zraw);
 #endif
     ivec4 c = (IIP != 0u) ? ivec4(i_col) : ivec4(i_fcol);
     int r = c.x, g = c.y, b = c.z, a = c.w;
@@ -370,7 +377,10 @@ void main() {
             bool zpass = (ZTST == 0u) ? false : ((ZTST == 2u) ? (z >= dz) : (z > dz));
             if (!zpass) return;
         }
-        if (write_z) zb_out = (ZFMT == 1u) ? ((zraw & 0xFF000000u) | z) : ((ZFMT == 2u) ? ((zraw & 0xFFFF0000u) | z) : z);
+        if (write_z) {
+            zb_out = (ZFMT == 1u) ? ((zraw & 0xFF000000u) | z) : ((ZFMT == 2u) ? ((zraw & 0xFFFF0000u) | z) : z);
+            gl_FragDepth = ZD(zb_out);
+        }
     }
 #endif
     if (!write_rgb && !write_a) return;
@@ -404,9 +414,9 @@ void main() {
     if (FPSM == 2u) {
         uint c16 = ((col >> 3) & 0x1Fu) | (((col >> 11) & 0x1Fu) << 5) | (((col >> 19) & 0x1Fu) << 10) | ((col >> 16) & 0x8000u);
         uint m16 = ((mask >> 3) & 0x1Fu) | (((mask >> 11) & 0x1Fu) << 5) | (((mask >> 19) & 0x1Fu) << 10) | ((mask >> 16) & 0x8000u);
-        fb_out = (raw & (m16 | 0xFFFF0000u)) | (c16 & ~m16 & 0xFFFFu);
+        fb_out = unpackUnorm4x8((raw & (m16 | 0xFFFF0000u)) | (c16 & ~m16 & 0xFFFFu));
     } else {
         if (FPSM == 1u) mask |= 0xFF000000u;
-        fb_out = (raw & mask) | (col & ~mask);
+        fb_out = unpackUnorm4x8((raw & mask) | (col & ~mask));
     }
 }

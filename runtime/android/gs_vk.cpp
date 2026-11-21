@@ -15,6 +15,7 @@
 //  - no HD texture replacement yet.
 #include "gs/gs_gpu.h"
 #include <array>
+#include <map>
 #include "gs/gs_drawstate.h"
 #include "gs/gs_mem.h"
 #include "gs/gs_texrep.h"
@@ -72,6 +73,7 @@ struct Img {
     VkImage img = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView view8 = VK_NULL_HANDLE;  // surfaces: the same bits as RGBA8 (render target: hardware blending)
     int w = 0, h = 0;
 };
 struct Buf {
@@ -84,6 +86,7 @@ struct Buf {
 
 static void destroy_now(Img& i) {
     if (i.view) vkDestroyImageView(dev, i.view, nullptr);
+    if (i.view8) vkDestroyImageView(dev, i.view8, nullptr);
     if (i.img) vkDestroyImage(dev, i.img, nullptr);
     if (i.mem) vkFreeMemory(dev, i.mem, nullptr);
     i = Img{};
@@ -136,7 +139,7 @@ static const VkImageUsageFlags TEX_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE
 
 static std::vector<VkImage> g_new_images;  // created since the pre buffer was recorded: layout -> GENERAL there
 
-static bool make_img(Img& i, int w, int h, VkFormat f, VkImageUsageFlags usage) {
+static bool make_img(Img& i, int w, int h, VkFormat f, VkImageUsageFlags usage, bool rgba8 = false) {
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = f;
@@ -147,6 +150,7 @@ static bool make_img(Img& i, int w, int h, VkFormat f, VkImageUsageFlags usage) 
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = usage;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (rgba8) ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     if (vkCreateImage(dev, &ii, nullptr, &i.img) != VK_SUCCESS) return false;
     VkMemoryRequirements r;
     vkGetImageMemoryRequirements(dev, i.img, &r);
@@ -167,6 +171,14 @@ static bool make_img(Img& i, int w, int h, VkFormat f, VkImageUsageFlags usage) 
     vi.format = f;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCreateImageView(dev, &vi, nullptr, &i.view);
+    if (rgba8) {
+        // R | G << 8 | B << 16 | A << 24 is RGBA8 in memory: the render target view
+        VkImageViewUsageCreateInfo vu{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        vu.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+        vi.pNext = &vu;
+        vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vkCreateImageView(dev, &vi, nullptr, &i.view8);
+    }
     i.w = w;
     i.h = h;
     g_new_images.push_back(i.img);
@@ -587,7 +599,47 @@ static std::vector<Surface*> g_surf;
 static u64 g_frame = 0;
 static Surface* surf_by_id(int id) { return (id >= 0 && id < (int)g_surf.size()) ? g_surf[id] : nullptr; }
 
-static bool create_tex(Surface* s) { return make_img(s->im, s->w * S, s->h * S, VK_FORMAT_R32_UINT, SURF_USAGE); }
+static bool create_tex(Surface* s) { return make_img(s->im, s->w * S, s->h * S, VK_FORMAT_R32_UINT, SURF_USAGE, true); }
+
+// depth attachments of the passes with a z surface, one per size: contents only within a pass (the
+// z surface stays the real one; begin_pass copies it in, every draw keeps both in step)
+static std::vector<Img> g_depth;
+static VkImageView depth_view(int w, int h) {
+    for (Img& d : g_depth)
+        if (d.w == w && d.h == h) return d.view;
+    Img d;
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_D32_SFLOAT;
+    ii.extent = {(uint32_t)w, (uint32_t)h, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(dev, &ii, nullptr, &d.img) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements r;
+    vkGetImageMemoryRequirements(dev, d.img, &r);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = r.size;
+    u32 t = vkc::mem_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT);
+    if (t == ~0u) t = vkc::mem_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    ai.memoryTypeIndex = t;
+    if (vkAllocateMemory(dev, &ai, nullptr, &d.mem) != VK_SUCCESS) { vkDestroyImage(dev, d.img, nullptr); return VK_NULL_HANDLE; }
+    vkBindImageMemory(dev, d.img, d.mem, 0);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = d.img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_D32_SFLOAT;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    vkCreateImageView(dev, &vi, nullptr, &d.view);
+    d.w = w;
+    d.h = h;
+    g_depth.push_back(d);
+    log_write(LOG_GS, "gpu: depth attachment %dx%d", w, h);
+    return d.view;
+}
 
 static void build_cells(Surface* s) {
     int ph = is16(s->lay) ? 64 : 32;
@@ -677,7 +729,7 @@ static VkSampler g_nearest = VK_NULL_HANDLE, g_linear = VK_NULL_HANDLE;
 static VkDescriptorSetLayout g_dsl_draw[2], g_dsl_util, g_dsl_merge, g_dsl_cell;
 static VkPipelineLayout g_pl_draw[2], g_pl_util, g_pl_merge, g_pl_cell;
 static VkRenderPass g_rp_draw[2], g_rp_out;
-static VkPipeline g_pipe_draw[2], g_pipe_up, g_pipe_down, g_pipe_merge, g_pipe_cell;
+static VkPipeline g_pipe_draw[2], g_pipe_up, g_pipe_down, g_pipe_merge, g_pipe_cell, g_pipe_zsync;
 static Img g_native;      // native-resolution scratch (refresh source / readback target)
 static Buf g_rb;          // CPU readback of g_native / of the composed picture
 static Img g_dummy_u, g_dummy_rgba;
@@ -716,7 +768,7 @@ static VkPipelineLayout make_pl(VkDescriptorSetLayout dsl, VkShaderStageFlags pc
 }
 
 static VkRenderPass make_draw_rp(bool z) {
-    VkAttachmentDescription a[2]{};
+    VkAttachmentDescription a[3]{};
     for (auto& x : a) {
         x.format = VK_FORMAT_R32_UINT;
         x.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -727,9 +779,18 @@ static VkRenderPass make_draw_rp(bool z) {
         x.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
         x.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
+    a[0].format = VK_FORMAT_R8G8B8A8_UNORM;  // the frame surface's RGBA8 view (hardware blending)
+    a[2].format = VK_FORMAT_D32_SFLOAT;      // depth mirror of the z surface (contents per pass)
+    a[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    a[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    a[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    a[2].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference refs[2] = {{0, VK_IMAGE_LAYOUT_GENERAL}, {1, VK_IMAGE_LAYOUT_GENERAL}};
+    VkAttachmentReference dref{2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sp{};
-    sp.flags = VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;
+    sp.pDepthStencilAttachment = z ? &dref : nullptr;
+    static const bool no_ro = getenv("GRANDIA_VK_NO_RASTER_ORDER") != nullptr;  // test: cost of the ordering (wrong picture)
+    sp.flags = no_ro ? 0 : VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;
     sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sp.colorAttachmentCount = z ? 2 : 1;
     sp.pColorAttachments = refs;
@@ -744,7 +805,7 @@ static VkRenderPass make_draw_rp(bool z) {
     dep.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
     dep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
     VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rp.attachmentCount = z ? 2 : 1;
+    rp.attachmentCount = z ? 3 : 1;
     rp.pAttachments = a;
     rp.subpassCount = 1;
     rp.pSubpasses = &sp;
@@ -760,21 +821,27 @@ static constexpr int NSPEC = 23;
 static bool g_texrep_on = false;   // texture replacement images exist (lang/<code>_tex, lang/all_tex)
 static VkPipelineCache g_pcache = VK_NULL_HANDLE;
 // g_draw_fs: specialized shader (draw.frag); g_draw_gen_fs: the general pipeline (draw_general.frag)
-static VkShaderModule g_draw_vs = VK_NULL_HANDLE, g_draw_fs[2] = {}, g_draw_gen_fs[2] = {};
-static VkPipeline make_draw_pipe(bool z, const u32* spec = nullptr) {
+static VkShaderModule g_draw_vs = VK_NULL_HANDLE, g_draw_fs[2] = {}, g_draw_gen_fs[2] = {}, g_draw_hw_fs[2] = {};
+// hw (hw_config): 0 = the programmable pipeline (reads the attachments, raster order); else bit 0 set,
+// bits 1-3 blend mode (0 none, 1 Cs*f+Cd*(1-f), 2 Cs*f+Cd, 3 Cd-Cs*f, 4 Cs*f, 5 keep Cd), bit 4 f from
+// the blend constant (FIX) instead of the output alpha, bits 5-6 GS z test, bit 7 z write, bits 8-11
+// colour write mask, bit 12 z surface write
+static VkPipeline make_draw_pipe(bool z, const u32* spec = nullptr, u32 hw = 0) {
     if (!g_draw_vs) {
         g_draw_vs = module(SPV_DRAW_VERT, sizeof(SPV_DRAW_VERT));
         g_draw_fs[0] = module(SPV_DRAW_FRAG, sizeof(SPV_DRAW_FRAG));
         g_draw_fs[1] = module(SPV_DRAW_Z_FRAG, sizeof(SPV_DRAW_Z_FRAG));
         g_draw_gen_fs[0] = module(SPV_DRAW_GENERAL_FRAG, sizeof(SPV_DRAW_GENERAL_FRAG));
         g_draw_gen_fs[1] = module(SPV_DRAW_GENERAL_Z_FRAG, sizeof(SPV_DRAW_GENERAL_Z_FRAG));
+        g_draw_hw_fs[0] = module(SPV_DRAW_HW_FRAG, sizeof(SPV_DRAW_HW_FRAG));
+        g_draw_hw_fs[1] = module(SPV_DRAW_HW_Z_FRAG, sizeof(SPV_DRAW_HW_Z_FRAG));
     }
     VkSpecializationMapEntry me[NSPEC];
     for (int i = 0; i < NSPEC; i++) me[i] = {(uint32_t)i, (uint32_t)(i * 4), 4};
     VkSpecializationInfo si{NSPEC, me, NSPEC * 4, spec};
     VkPipelineShaderStageCreateInfo st[2]{};
     st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, g_draw_vs, "main"};
-    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, spec ? g_draw_fs[z] : g_draw_gen_fs[z], "main",
+    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, hw ? g_draw_hw_fs[z] : (spec ? g_draw_fs[z] : g_draw_gen_fs[z]), "main",
              spec ? &si : nullptr};
     VkVertexInputBindingDescription vb{0, 68, VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription va[7] = {
@@ -799,13 +866,38 @@ static VkPipeline make_draw_pipe(bool z, const u32* spec = nullptr) {
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState ba[2]{};
     ba[0].colorWriteMask = ba[1].colorWriteMask = 0xF;
+    // depth mirror: the programmable pipelines write it (gl_FragDepth) for every pixel they keep
+    VkPipelineDepthStencilStateCreateInfo dz{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dz.depthTestEnable = VK_TRUE;
+    dz.depthWriteEnable = VK_TRUE;
+    dz.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    if (hw) {
+        static const VkCompareOp ops[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
+        dz.depthCompareOp = ops[(hw >> 5) & 3];
+        dz.depthWriteEnable = (hw >> 7) & 1;
+        ba[0].colorWriteMask = (hw >> 8) & 0xF;
+        ba[1].colorWriteMask = ((hw >> 12) & 1) ? 0xF : 0;
+        u32 mode = (hw >> 1) & 7, kc = (hw >> 4) & 1;
+        if (mode >= 1 && mode <= 4) {
+            VkBlendFactor f = kc ? VK_BLEND_FACTOR_CONSTANT_COLOR : VK_BLEND_FACTOR_SRC_ALPHA;
+            ba[0].blendEnable = VK_TRUE;
+            ba[0].srcColorBlendFactor = f;
+            ba[0].dstColorBlendFactor = mode == 1 ? (kc ? VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                                      : (mode == 4 ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE);
+            ba[0].colorBlendOp = mode == 3 ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD;
+            // written alpha = As: with f in the output alpha (As/128) times the constant 128/255
+            ba[0].srcAlphaBlendFactor = kc ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_CONSTANT_ALPHA;
+            ba[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            ba[0].alphaBlendOp = VK_BLEND_OP_ADD;
+        }
+    }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.flags = VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+    cb.flags = (hw || getenv("GRANDIA_VK_NO_RASTER_ORDER")) ? 0 : VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     cb.attachmentCount = z ? 2 : 1;
     cb.pAttachments = ba;
-    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
     VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    ds.dynamicStateCount = 2;
+    ds.dynamicStateCount = hw ? 3 : 2;
     ds.pDynamicStates = dyn;
     VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     pi.stageCount = 2;
@@ -816,6 +908,7 @@ static VkPipeline make_draw_pipe(bool z, const u32* spec = nullptr) {
     pi.pRasterizationState = &rs;
     pi.pMultisampleState = &ms;
     pi.pColorBlendState = &cb;
+    pi.pDepthStencilState = z ? &dz : nullptr;
     pi.pDynamicState = &ds;
     pi.layout = g_pl_draw[z];
     pi.renderPass = g_rp_draw[z];
@@ -870,13 +963,13 @@ static void pcache_save() {
 static std::unordered_map<u64, VkPipeline> g_draw_pipes;  // (VK_NULL_HANDLE: being compiled)
 static std::atomic<u64> st_pipes_new{0};
 static double st_pipes_ms = 0;  // (under g_pjob_mu)
-struct PJob { u64 key; bool z; u32 spec[NSPEC]; };
+struct PJob { u64 key; bool z; u32 spec[NSPEC]; u32 hw; };
 static std::mutex g_pjob_mu;
 static std::condition_variable g_pjob_cv;
 static std::deque<PJob> g_pjobs;
 static std::vector<std::pair<u64, VkPipeline>> g_pjob_done;
 static bool g_pjob_thread = false;
-static VkPipeline draw_pipe_for(bool z, const u32* spec) {
+static VkPipeline draw_pipe_for(bool z, const u32* spec, u32 hw = 0) {
     static const bool no_spec = getenv("GRANDIA_VK_NO_SPEC") != nullptr;  // test: the general pipeline only
     if (no_spec) return g_pipe_draw[z];
     // test GRANDIA_VK_SPEC_GEN=i:v: batches whose constant i is v draw with the general pipeline
@@ -894,6 +987,7 @@ static VkPipeline draw_pipe_for(bool z, const u32* spec) {
         key |= (u64)(spec[i] & ((1u << BITS[i]) - 1)) << sh;
         sh += BITS[i];
     }
+    key |= (u64)hw << 40;
     // compiled pipelines from the background thread
     {
         std::lock_guard<std::mutex> lk(g_pjob_mu);
@@ -905,7 +999,7 @@ static VkPipeline draw_pipe_for(bool z, const u32* spec) {
     // a new combination: compiled in the background (a driver compile takes ~0.4 s on the phone, a
     // stutter per new effect); until then the general pipeline (the same shader without constants) draws
     g_draw_pipes[key] = VK_NULL_HANDLE;
-    PJob j{key, z, {}};
+    PJob j{key, z, {}, hw};
     memcpy(j.spec, spec, sizeof j.spec);
     {
         std::lock_guard<std::mutex> lk(g_pjob_mu);
@@ -922,7 +1016,7 @@ static VkPipeline draw_pipe_for(bool z, const u32* spec) {
                         g_pjobs.pop_front();
                     }
                     double t0 = host_time_sec();
-                    VkPipeline p = make_draw_pipe(job.z, job.spec);
+                    VkPipeline p = make_draw_pipe(job.z, job.spec, job.hw);
                     double ms = (host_time_sec() - t0) * 1000.0;
                     std::lock_guard<std::mutex> lk(g_pjob_mu);
                     g_pjob_done.push_back({job.key, p});
@@ -947,6 +1041,56 @@ static VkPipeline make_compute(const uint32_t* code, size_t bytes, VkPipelineLay
     VkPipeline p = VK_NULL_HANDLE;
     vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &p);
     vkDestroyShaderModule(dev, cs, nullptr);
+    return p;
+}
+
+// start of a pass with a z surface: z surface -> depth attachment (zsync.frag)
+static VkPipeline make_zsync_pipe() {
+    VkShaderModule vs = module(SPV_FULL_VERT, sizeof(SPV_FULL_VERT)), fs = module(SPV_ZSYNC_FRAG, sizeof(SPV_ZSYNC_FRAG));
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main"};
+    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main"};
+    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba[2]{};
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 2;
+    cb.pAttachments = ba;
+    VkPipelineDepthStencilStateCreateInfo dz{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dz.depthTestEnable = VK_TRUE;
+    dz.depthWriteEnable = VK_TRUE;
+    dz.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2;
+    ds.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pi.stageCount = 2;
+    pi.pStages = st;
+    pi.pVertexInputState = &vin;
+    pi.pInputAssemblyState = &ia;
+    pi.pViewportState = &vp;
+    pi.pRasterizationState = &rs;
+    pi.pMultisampleState = &ms;
+    pi.pColorBlendState = &cb;
+    pi.pDepthStencilState = &dz;
+    pi.pDynamicState = &ds;
+    pi.layout = g_pl_draw[1];
+    pi.renderPass = g_rp_draw[1];
+    VkPipeline p = VK_NULL_HANDLE;
+    vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pi, nullptr, &p);
+    vkDestroyShaderModule(dev, vs, nullptr);
+    vkDestroyShaderModule(dev, fs, nullptr);
     return p;
 }
 
@@ -1115,6 +1259,8 @@ bool init(int scale) {
     g_pipe_down = make_compute(SPV_DOWNSAMPLE_COMP, sizeof(SPV_DOWNSAMPLE_COMP));
     g_pipe_cell = make_compute(SPV_CELLCOPY_COMP, sizeof(SPV_CELLCOPY_COMP), g_pl_cell);
     g_pipe_merge = make_merge_pipe();
+    g_pipe_zsync = make_zsync_pipe();
+    if (!g_pipe_zsync) return false;
     if (!g_pipe_draw[0] || !g_pipe_draw[1] || !g_pipe_up || !g_pipe_down || !g_pipe_cell || !g_pipe_merge) return false;
 
     for (FrameRes& f : g_fr) {
@@ -1176,10 +1322,10 @@ static VkFramebuffer get_fb(Surface* fs, Surface* zs) {
     VkImage b = zs ? zs->im.img : VK_NULL_HANDLE;
     for (const FbEntry& e : g_fbs)
         if (e.a == fs->im.img && e.b == b) return e.fb;
-    VkImageView v[2] = {fs->im.view, zs ? zs->im.view : VK_NULL_HANDLE};
+    VkImageView v[3] = {fs->im.view8, zs ? zs->im.view : VK_NULL_HANDLE, zs ? depth_view(fs->w * S, fs->h * S) : VK_NULL_HANDLE};
     VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fi.renderPass = g_rp_draw[zs ? 1 : 0];
-    fi.attachmentCount = zs ? 2 : 1;
+    fi.attachmentCount = zs ? 3 : 1;
     fi.pAttachments = v;
     fi.width = fs->w * S;
     fi.height = fs->h * S;
@@ -1208,6 +1354,17 @@ static void begin_pass(Surface* fs, Surface* zs) {
     g_bound_pipe = VK_NULL_HANDLE;  // (flush binds the batch's specialized pipeline)
     VkViewport vp{0, 0, (float)(fs->w * S), (float)(fs->h * S), 0, 1};
     vkCmdSetViewport(g_main, 0, 1, &vp);
+    if (zs) {
+        // the depth attachment (contents per pass) takes the z surface's values
+        VkRect2D full{{0, 0}, {(uint32_t)(fs->w * S), (uint32_t)(fs->h * S)}};
+        vkCmdSetScissor(g_main, 0, 1, &full);
+        vkCmdBindPipeline(g_main, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_zsync);
+        VkDescriptorImageInfo zi{VK_NULL_HANDLE, zs->im.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 11, 0, 1, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &zi, nullptr, nullptr};
+        pushDS(g_main, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_draw[1], 0, 1, &w);
+        vkCmdDraw(g_main, 4, 1, 0, 0);
+        g_bound_pipe = g_pipe_zsync;
+    }
     g_pass_sc = VkRect2D{{-1, -1}, {0, 0}};
     g_in_pass = true;
     g_pass_a = fs->im.img;
@@ -1668,6 +1825,9 @@ static bool g_bself = false;
 static bool g_bself_tex = false;
 static bool g_btme = false;
 static bool g_bover = true;
+static bool g_bmixed = false;      // primitives of the batch differ in alpha test / blend state (no hw path)
+static u32 g_bkey0 = 0, g_bkey1 = 0;
+static u64 st_hw_batches = 0;
 static u32 g_ps0 = 0, g_ps1 = 0;
 static bool g_bhud = false;
 static bool g_ball_sprites = true;
@@ -1943,6 +2103,48 @@ static VkDeviceSize clut_offset() {
     return g_clut_off;
 }
 
+// The hardware path: GS blending, alpha test and z test as pipeline state on the RGBA8 view and the
+// depth attachment, no attachment reads, so no raster order (half of the GPU time in the forest).
+// An alpha test whose failing pixels still write something becomes two draws (passing part, failing
+// part with its own masks). Anything else (16/24-bit targets, frame masks, destination alpha test,
+// Ad as factor, per-pixel blending, mixed batches) keeps the programmable pipeline.
+struct HwDraw { u32 hw, part, amode; };
+static int hw_config(const DrawState& ds, bool z, u32 zf, u32 fpk, HwDraw* out) {
+    static const bool off = getenv("GRANDIA_VK_NO_HW") != nullptr;  // test: programmable only
+    if (off || g_bmixed || fpk != 0 || ds.fbmsk != 0 || (z && zf != 0) || ds.date || ds.fba || !ds.colclamp) return 0;
+    u32 mode = 0, kc = 0;
+    if (ds.abe) {
+        if (ds.pabe || ds.bc == 1) return 0;
+        kc = ds.bc == 2 ? 1 : 0;
+        u32 A = ds.ba, B = ds.bb, D = ds.bd;
+        if (A == 0 && B == 1 && D == 1) mode = 1;
+        else if (A == 0 && B == 2 && D == 1) mode = 2;
+        else if (A == 2 && B == 0 && D == 1) mode = 3;
+        else if (A == 0 && B == 2 && D == 2) mode = 4;
+        else if (A == B && D == 0) mode = 0;
+        else if (A == B && D == 1) mode = 5;
+        else return 0;
+    }
+    if (mode == 0 || mode == 5) kc = 0;
+    u32 cmask = mode == 5 ? 0x8u : 0xFu;
+    bool zw = z && !ds.zmsk;
+    u32 zt = z ? ds.ztst : 1;
+    u32 amode = (mode >= 1 && mode <= 4 && !kc) ? 1 : 0;
+    auto enc = [&](u32 cm, bool w) { return 1u | mode << 1 | kc << 4 | zt << 5 | (w ? 1u : 0u) << 7 | cm << 8 | (w ? 1u : 0u) << 12; };
+    int n = 0;
+    if (!ds.ate || ds.atst == 1 || ds.afail == 0) {
+        out[n++] = {enc(cmask, zw), 0, amode};
+        return n;
+    }
+    if (ds.atst != 0) out[n++] = {enc(cmask, zw), 1, amode};
+    u32 fm = cmask;
+    bool fz = false;
+    if (ds.afail == 2) { fm = 0; fz = zw; }
+    else if (ds.afail == 3) fm = cmask & 0x7u;
+    if (fm || fz) out[n++] = {enc(fm, fz), 2, amode};
+    return n;
+}
+
 static void flush() {
     if (!g_bvalid || g_verts.empty()) {
         g_verts.clear();
@@ -2034,7 +2236,7 @@ static void flush() {
     // ring memory first (a full ring submits, which ends the render pass)
     size_t bytes = g_verts.size() * sizeof(GV);
     if (bytes > VB_BYTES) bytes = VB_BYTES / sizeof(GV) / 3 * 3 * sizeof(GV);
-    ring_reserve(sizeof(g_clut) + sizeof(DrawCB) + bytes + 3 * g_align);
+    ring_reserve(sizeof(g_clut) + 3 * sizeof(DrawCB) + bytes + 5 * g_align);
     VkDeviceSize clut_off = clut_offset();
     u8* pc;
     VkDeviceSize cb_off = ring_alloc(sizeof(DrawCB), &pc);
@@ -2043,13 +2245,27 @@ static void flush() {
     if (!pc || !pv) { g_verts.clear(); g_bprims = 0; return; }
     memcpy(pc, &c, sizeof(c));
     memcpy(pv, g_verts.data(), bytes);
+    // hardware path when its pipelines are compiled (else the programmable one, compiling them meanwhile)
+    HwDraw hwd[2];
+    int nhw = hw_config(ds, zs != nullptr, zf, fpk, hwd);
+    VkPipeline hp[2] = {};
+    VkDeviceSize cb_offs[2] = {cb_off, cb_off};
+    for (int i = 0; i < nhw; i++) {
+        hp[i] = draw_pipe_for(zs != nullptr, sp, hwd[i].hw);
+        if (hp[i] == g_pipe_draw[zs ? 1 : 0]) nhw = 0;
+    }
+    for (int i = 0; i < nhw; i++) {
+        DrawCB cc = c;
+        cc.f12[0] = hwd[i].part;
+        cc.f12[1] = hwd[i].amode;
+        u8* p2;
+        cb_offs[i] = ring_alloc(sizeof(DrawCB), &p2);
+        if (!p2) { nhw = 0; break; }
+        memcpy(p2, &cc, sizeof cc);
+    }
+    if (nhw) st_hw_batches++;
 
     begin_pass(fs, zs);
-    VkPipeline pipe = draw_pipe_for(g_pass_z != 0, sp);
-    if (pipe != g_bound_pipe) {
-        vkCmdBindPipeline(g_main, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        g_bound_pipe = pipe;
-    }
     VkBuffer rb = fr().ring.buf;
     VkDescriptorBufferInfo ubo{rb, cb_off, sizeof(DrawCB)};
     VkDescriptorBufferInfo clut{rb, clut_off, sizeof(g_clut)};
@@ -2057,7 +2273,7 @@ static void flush() {
     VkDescriptorImageInfo mi[6];
     for (int l = 0; l < 6; l++) mi[l] = {VK_NULL_HANDLE, l < nmips && mip_view[l] ? mip_view[l] : g_dummy_u.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo hd{VK_NULL_HANDLE, g_dummy_rgba.view, VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo fin{VK_NULL_HANDLE, fs->im.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo fin{VK_NULL_HANDLE, fs->im.view8, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo zin{VK_NULL_HANDLE, zs ? zs->im.view : VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet all[12];
     int na = 0;
@@ -2071,7 +2287,6 @@ static void flush() {
     wr(9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hd, nullptr);
     wr(10, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &fin, nullptr);
     if (zs) wr(11, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &zin, nullptr);
-    pushDS(g_main, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_draw[g_pass_z], 0, (uint32_t)na, all);
     int fw = fs->w * S, fh = fs->h * S;
     int sx0 = std::clamp(ds.scax0 * S, 0, fw), sy0 = std::clamp(ds.scay0 * S, 0, fh);
     int sx1 = std::clamp((ds.scax1 + 1) * S, 0, fw), sy1 = std::clamp((ds.scay1 + 1) * S, 0, fh);
@@ -2081,9 +2296,22 @@ static void flush() {
         g_pass_sc = sc;
     }
     vkCmdBindVertexBuffers(g_main, 0, 1, &rb, &vb_off);
-    if (!platform::skip_active() && sc.extent.width && sc.extent.height) {
-        vkCmdDraw(g_main, (uint32_t)(bytes / sizeof(GV)), 1, 0, 0);
-        prof_draw();
+    for (int di = 0; di < (nhw ? nhw : 1); di++) {
+        VkPipeline pipe = nhw ? hp[di] : draw_pipe_for(g_pass_z != 0, sp);
+        if (pipe != g_bound_pipe) {
+            vkCmdBindPipeline(g_main, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            g_bound_pipe = pipe;
+        }
+        ubo.offset = cb_offs[nhw ? di : 0];
+        pushDS(g_main, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pl_draw[g_pass_z], 0, (uint32_t)na, all);
+        if (nhw) {
+            float k = (float)ds.bfix / 128.0f, bc[4] = {k, k, k, 128.0f / 255.0f};
+            vkCmdSetBlendConstants(g_main, bc);
+        }
+        if (!platform::skip_active() && sc.extent.width && sc.extent.height) {
+            vkCmdDraw(g_main, (uint32_t)(bytes / sizeof(GV)), 1, 0, 0);
+            prof_draw();
+        }
     }
     st_batches++;
     if (!g_no_uav_overlap) end_pass();  // test: --uav-overlap = a render pass per batch
@@ -2221,8 +2449,28 @@ static bool prim_overwrites(const DrawState& ds) {
     return !ds.date && (!ds.ate || ds.atst == 1) && !blend_reads_dst;
 }
 
+static std::map<std::string, u64> g_hist;  // (test GRANDIA_VK_HIST)
 void on_draw(const DrawState& ds, u32 state_id, int prim, const Vertex* vin) {
     st_draws++;
+    static const bool hist = getenv("GRANDIA_VK_HIST") != nullptr;
+    if (hist) {
+        char k[160];
+        snprintf(k, sizeof k, "abe%d %d%d%d%d fix%02x pabe%d | ate%d atst%d aref%02x afail%d | date%d | zte%d ztst%d zmsk%d zpsm%02x | fpsm%02x fbmsk%08x fba%d clamp%d tme%d",
+                 ds.abe, ds.ba, ds.bb, ds.bc, ds.bd, ds.bfix, ds.pabe, ds.ate, ds.atst, ds.aref, ds.afail, ds.date, ds.zte, ds.ztst, ds.zmsk,
+                 ds.zpsm, ds.fpsm, ds.fbmsk, ds.fba, ds.colclamp, ds.tme);
+        g_hist[k]++;
+        static double last = 0;
+        double now = host_time_sec();
+        if (now - last > 15.0 && last != 0) {
+            std::vector<std::pair<u64, std::string>> v;
+            u64 tot = 0;
+            for (auto& [kk, n] : g_hist) { v.push_back({n, kk}); tot += n; }
+            std::sort(v.rbegin(), v.rend());
+            for (size_t i = 0; i < v.size() && i < 14; i++) log_write(LOG_GS, "hist %5.1f%% %s", 100.0 * v[i].first / tot, v[i].second.c_str());
+            g_hist.clear();
+        }
+        if (last == 0 || now - last > 15.0) last = now;
+    }
     Vertex hv[3];
     bool hud = hud_transform(ds, prim, vin, hv);
     const Vertex* v = hud ? hv : vin;
@@ -2233,6 +2481,11 @@ void on_draw(const DrawState& ds, u32 state_id, int prim, const Vertex* vin) {
         g_bid = state_id;
         g_btme |= ds.tme;
         g_bover &= prim_overwrites(ds);
+        {
+            u32 s0, s1;
+            prim_state(ds, s0, s1);
+            if ((s0 & 0x0FFFFFFFu) != g_bkey0 || (s1 & 0xFFu) != g_bkey1) g_bmixed = true;
+        }
         prim_state(ds, g_ps0, g_ps1);
     }
     if (state_id != g_bid || hud != g_bhud || g_bself) {
@@ -2260,6 +2513,13 @@ void on_draw(const DrawState& ds, u32 state_id, int prim, const Vertex* vin) {
         g_bself = ds.tme && g_bself_tex;
         g_btme = ds.tme;
         g_bover = prim_overwrites(ds);
+        {
+            u32 s0, s1;
+            prim_state(ds, s0, s1);
+            g_bkey0 = s0 & 0x0FFFFFFFu;
+            g_bkey1 = s1 & 0xFFu;
+            g_bmixed = false;
+        }
         prim_state(ds, g_ps0, g_ps1);
     }
     const DrawState& b = g_bds;
@@ -2609,6 +2869,12 @@ std::string stats() {
     l_gcopy = st_gpu_copy_cells; l_skip = st_skip_cells; l_rehash = st_tex_rehash; l_passes = st_passes; l_vers = st_tex_versions;
     l_draws = st_draws; l_batches = st_batches; l_refresh = st_refresh_cells; l_rbc = st_readback_cells; l_rb = st_readbacks;
     l_dec = st_tex_decodes; l_hits = st_tex_hits; l_stale = st_stale_texels; l_self = st_self;
+    {
+        static u64 l_hw = 0;
+        size_t n = strlen(b);
+        snprintf(b + n, sizeof(b) - n, ", hw batches %llu", (unsigned long long)(st_hw_batches - l_hw));
+        l_hw = st_hw_batches;
+    }
     static u64 l_rep = 0;
     if (st_tex_replaced != l_rep) {
         size_t n = strlen(b);

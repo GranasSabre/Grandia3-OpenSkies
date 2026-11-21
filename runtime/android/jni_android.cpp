@@ -172,6 +172,22 @@ std::string g3_pick_document() {
     }
 }
 
+// the name of a connected game controller ("" without one); false: the activity cannot tell
+bool g3_gamepad_name(std::string& name) {
+    name.clear();
+    Jni j;
+    jmethodID m = j.env ? j.method("gamepadName", "()Ljava/lang/String;") : nullptr;
+    if (!m) return false;
+    jstring r = (jstring)j.env->CallObjectMethod(g3_activity->clazz, m);
+    if (j.failed()) return false;
+    if (r) {
+        const char* c = j.env->GetStringUTFChars(r, nullptr);
+        name = c && *c ? c : "controller";
+        if (c) j.env->ReleaseStringUTFChars(r, c);
+    }
+    return true;
+}
+
 // a message for the player (a long toast); false without the activity's helper
 bool g3_show_message(const std::string& utf8) {
     Jni j;

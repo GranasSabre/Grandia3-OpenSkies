@@ -4,6 +4,7 @@ import android.app.NativeActivity;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
+import android.view.InputDevice;
 import android.widget.Toast;
 
 // The game is native (android_main in libgrandia3.so); this subclass only adds what needs Java:
@@ -64,6 +65,25 @@ public class GrandiaActivity extends NativeActivity {
         } catch (Exception e) {
             return -1;
         }
+    }
+
+    // the name of a connected game controller (gamepad or joystick, not a virtual device), null without one;
+    // the touch controls stay hidden while one is connected (touch_android.cpp)
+    public String gamepadName() {
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d == null || d.isVirtual()) continue;
+            // built-in helper devices of some phones report gamepad sources too (Xiaomi "uinput-xiaomi"):
+            // only external controllers (Bluetooth, USB) count
+            String n = d.getName();
+            if (n != null && n.startsWith("uinput")) continue;
+            if (android.os.Build.VERSION.SDK_INT >= 29 && !d.isExternal()) continue;
+            int s = d.getSources();
+            if ((s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                    || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK)
+                return d.getName();
+        }
+        return null;
     }
 
     public void showMessage(final String text) {

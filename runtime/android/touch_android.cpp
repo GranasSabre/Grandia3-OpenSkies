@@ -1,13 +1,19 @@
 // Touch controls: a translucent virtual pad drawn over the picture (left: L1/L2, d-pad, analog
 // stick; right: R1/R2, triangle/circle/cross/square; bottom center: SELECT, START; top center: the
 // settings menu). Multi-touch;
-// sliding between buttons works. Hidden while a game controller is used, back on the next touch.
+// sliding between buttons works. Fades out after a few seconds without a touch (cutscenes stay clean;
+// the next touch brings it back and does not press anything yet); always hidden while a game
+// controller is connected (or, if the activity cannot tell, after it was used until the next touch).
+// A finger that goes down away from the controls turns the camera: its sideways speed drives the
+// right stick (camera()), also while the controls are faded out.
 // Layout in window-buffer pixels: the present thread passes the buffer and window sizes.
 #include "touch_android.h"
 #include <android/input.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <string>
 #include <map>
 #include <cstring>
 #include <mutex>
@@ -17,13 +23,30 @@ namespace touch {
 namespace {
 std::mutex g_m;
 int g_bw = 0, g_bh = 0, g_ww = 1, g_wh = 1;  // buffer and window sizes
-std::atomic<bool> g_visible{true};
+std::atomic<bool> g_pad_used{false};      // a controller button or stick was used (fallback detection)
+std::atomic<bool> g_pad_connected{false}; // the activity reports a connected game controller
+std::atomic<bool> g_autohide{true};
+std::atomic<int64_t> g_last_touch{0};     // ms (steady clock)
+std::atomic<int> g_fingers{0};            // fingers on the screen (input thread)
+std::atomic<bool> g_forget{false};        // the input thread forgets its fingers at the next event
+std::atomic<float> g_cam_px{0};           // camera swipe: sideways movement not yet taken (buffer pixels)
+std::atomic<int> g_cam_fingers{0};        // fingers swiping the camera
+std::atomic<float> g_cam_speed{7.0f};     // swipe speed factor (menu option, 1..15)
+std::atomic<float> g_cam_boost{1.0f};     // beyond a full stick: the game turns faster (reward_hooks.cpp)
+std::atomic<bool> g_dpad{false};          // d-pad shown (menu option; the left stick works in the menus)
+std::atomic<int> g_alpha_q{16};           // current opacity, 0..16
+float g_draw_alpha = 1;                   // opacity while drawing (present thread)
+constexpr int64_t HIDE_AFTER_MS = 5000, FADE_MS = 600;
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 std::atomic<u32> g_buttons{0};
 std::atomic<int> g_lx{0}, g_ly{0};
 std::atomic<bool> g_stick_on{false};
 std::atomic<u64> g_version{1};  // changes with every change of the overlay's looks
 
-enum Ctl { NONE, STICK, BUTTONS };
+enum Ctl { NONE, STICK, BUTTONS, CAMERA };  // NONE: the touch that woke the hidden controls (presses nothing)
 struct Pointer { Ctl ctl; float x, y; };
 std::map<int32_t, Pointer> g_ptr;  // pointer id -> what it controls (input thread)
 
@@ -74,7 +97,7 @@ u32 hit(const Layout& l, float x, float y) {
     for (const Btn* k : {&l.shoulder[0], &l.shoulder[1], &l.shoulder[2], &l.shoulder[3], &l.small[0], &l.small[1], &l.menu})
         if (x >= k->x0 - m && x <= k->x1 + m && y >= k->y0 - m && y <= k->y1 + m) b |= k->bit;
     float dx = x - l.dpad_x, dy = y - l.dpad_y, d = std::sqrt(dx * dx + dy * dy);
-    if (d <= l.dpad_r + m && d > 8 * l.u) {
+    if (g_dpad && d <= l.dpad_r + m && d > 8 * l.u) {
         float a = std::atan2(dy, dx);  // 8 sectors: diagonals press two directions
         int s = (int)std::lround(a / (3.14159265f / 4)) & 7;
         static const u32 dirs[8] = {RIGHT, RIGHT | DOWN, DOWN, DOWN | LEFT, LEFT, LEFT | UP, UP, UP | RIGHT};
@@ -93,7 +116,7 @@ void update_from_pointers(const Layout& l) {
             if (len > 1) dx /= len, dy /= len;
             g_lx = (int)(dx * 32767), g_ly = (int)(dy * 32767);
             stick = true;
-        } else {
+        } else if (p.ctl == BUTTONS) {
             b |= hit(l, p.x, p.y);
         }
     }
@@ -108,6 +131,7 @@ void update_from_pointers(const Layout& l) {
 
 // ---- drawing (buffer pixels are RGBX, R in the low byte) ----
 inline void blend(u32& d, u32 rgb, float a) {
+    a *= g_draw_alpha;
     if (a <= 0) return;
     if (a > 1) a = 1;
     u32 ia = (u32)(a * 256), na = 256 - ia;
@@ -194,7 +218,9 @@ void layout(int bw, int bh, int ww, int wh) {
 }
 
 void draw(u32* px, int stride) {
-    if (!g_visible) return;
+    int q = g_alpha_q;
+    if (q <= 0) return;
+    g_draw_alpha = q / 16.0f;
     Layout l;
     int bw, bh;
     {
@@ -215,6 +241,7 @@ void draw(u32* px, int stride) {
     // d-pad: four arms
     struct Arm { u32 bit; float dx, dy; };
     for (Arm a : {Arm{UP, 0, -1}, Arm{DOWN, 0, 1}, Arm{LEFT, -1, 0}, Arm{RIGHT, 1, 0}}) {
+        if (!g_dpad) break;
         float cx = l.dpad_x + a.dx * 36 * u, cy = l.dpad_y + a.dy * 36 * u, h = 18 * u;
         rrect(c, cx - h, cy - h, cx + h, cy + h, 5 * u, WHITE, (pressed & a.bit) ? on : base);
         // arrow
@@ -279,9 +306,21 @@ bool on_motion(const AInputEvent* e) {
         sx = (float)g_bw / g_ww;
         sy = (float)g_bh / g_wh;
     }
-    if (!g_visible.exchange(true)) g_version++;
+    if (g_forget.exchange(false)) g_ptr.clear();
     int32_t act = AMotionEvent_getAction(e), kind = act & AMOTION_EVENT_ACTION_MASK;
     size_t idx = (size_t)((act & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+    if (g_pad_connected) {
+        // a controller is connected: the controls stay hidden; only the menu button still answers a tap
+        if (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+            size_t i = kind == AMOTION_EVENT_ACTION_DOWN ? 0 : idx;
+            if (hit(l, AMotionEvent_getX(e, i) * sx, AMotionEvent_getY(e, i) * sy) & MENU) g_menu_tap = true;
+        }
+        return true;
+    }
+    // hidden (faded out, or a controller was used): this touch only brings the controls back
+    bool wake = g_alpha_q == 0;
+    g_last_touch = now_ms();
+    if (g_pad_used.exchange(false)) g_version++;
     if (kind == AMOTION_EVENT_ACTION_CANCEL) {
         g_ptr.clear();
     } else if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_POINTER_UP) {
@@ -294,20 +333,27 @@ bool on_motion(const AInputEvent* e) {
             float x = AMotionEvent_getX(e, i) * sx, y = AMotionEvent_getY(e, i) * sy;
             auto it = g_ptr.find(id);
             if (it == g_ptr.end()) {
-                // a new finger: on the stick area it drives the stick until it is lifted
+                // a new finger: on the stick area it drives the stick until it is lifted; away from
+                // every control it turns the camera (also on hidden controls)
                 bool on_stick = std::hypot(x - l.stick_x, y - l.stick_y) <= l.stick_r * 1.3f;
-                g_ptr[id] = {on_stick ? STICK : BUTTONS, x, y};
+                bool free = !on_stick && hit(l, x, y) == 0;
+                g_ptr[id] = {free ? CAMERA : (wake ? NONE : (on_stick ? STICK : BUTTONS)), x, y};
             } else {
+                if (it->second.ctl == CAMERA) g_cam_px = g_cam_px + (x - it->second.x);
                 it->second.x = x, it->second.y = y;
             }
         }
     }
+    g_fingers = (int)g_ptr.size();
+    int cams = 0;
+    for (auto& [id, p] : g_ptr) cams += p.ctl == CAMERA;
+    g_cam_fingers = cams;
     update_from_pointers(l);
     return true;
 }
 
 void controller_used() {
-    if (g_visible.exchange(false)) {
+    if (!g_pad_used.exchange(true)) {
         g_version++;
         g_buttons = 0;
         g_lx = g_ly = 0;
@@ -323,10 +369,83 @@ void release_all() {
     g_buttons = 0;
     g_lx = g_ly = 0;
     g_stick_on = false;
+    g_fingers = 0;
+    g_last_touch = now_ms();  // (after the menu: the controls are there again for a while)
     g_version++;
 }
-u64 version() { return g_version; }
-bool visible() { return g_visible; }
+
+void set_camera_speed(int s) { g_cam_speed = (float)std::clamp(s, 1, 15); }
+void set_dpad(bool on) {
+    g_dpad = on;
+    g_version++;
+}
+
+void set_autohide(bool on) {
+    g_autohide = on;
+    g_last_touch = now_ms();
+    g_version++;
+}
+
+u64 version() {
+    int64_t t = now_ms();
+    // a connected controller (asked of the activity about once a second)
+    static int64_t next_poll = 0;
+    if (t >= next_poll) {
+        next_poll = t + 1000;
+        std::string name;
+        if (g3_gamepad_name(name)) {
+            bool c = !name.empty();
+            if (c != g_pad_connected.exchange(c)) {
+                log_write(LOG_PAD, "touch: game controller %s%s", c ? "connected: " : "gone", name.c_str());
+                if (c) {
+                    g_forget = true;
+                    g_buttons = 0;
+                    g_lx = g_ly = 0;
+                    g_stick_on = false;
+                    g_fingers = 0;
+                }
+                g_last_touch = t;
+                g_version++;
+            }
+        }
+    }
+    int q = 16;
+    if (g_pad_connected || g_pad_used) q = 0;
+    else if (g_autohide && g_fingers == 0) {
+        int64_t idle = t - g_last_touch;
+        if (g_last_touch == 0) g_last_touch = t, idle = 0;
+        if (idle > HIDE_AFTER_MS) q = (int)std::max<int64_t>(0, 16 - (idle - HIDE_AFTER_MS) * 16 / FADE_MS);
+    }
+    if (q != g_alpha_q.exchange(q)) g_version++;
+    return g_version;
+}
+bool visible() { return g_alpha_q > 0; }
+
+float camera_boost() { return g_cam_fingers > 0 || g_cam_px != 0.0f ? g_cam_boost.load() : 1.0f; }
+
+bool camera(int* rx) {
+    // the swipe speed since the last call (at least ~a frame apart; repeated calls in between get
+    // the same value), smoothed a little; with speed 7 a seventh of the screen width per second = full stick
+    static int64_t last = 0;
+    static float v = 0;
+    static int out = 0;
+    int64_t t = now_ms();
+    if (g_cam_fingers == 0 && g_cam_px == 0.0f && v == 0) return false;
+    if (t - last >= 12) {
+        float dt = (float)std::min<int64_t>(t - last, 100) / 1000.0f;
+        last = t;
+        float px = g_cam_px.exchange(0);
+        float w = (float)std::max(1, g_bw);
+        float target = px / dt / w * g_cam_speed;
+        v = v * 0.4f + target * 0.6f;
+        if (g_cam_fingers == 0 && std::fabs(v) < 0.02f) v = 0;
+        out = (int)std::clamp(v * 32767.0f, -32767.0f, 32767.0f);
+        g_cam_boost = std::clamp(std::fabs(v), 1.0f, 3.0f);
+    }
+    *rx = out;
+    return v != 0 || g_cam_fingers > 0;
+}
+bool pad_active() { return g_pad_connected || g_pad_used; }
 bool stick(int* lx, int* ly) {
     if (!g_stick_on) return false;
     *lx = g_lx, *ly = g_ly;

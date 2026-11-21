@@ -7,11 +7,16 @@
 #ifndef HAS_Z
 #define HAS_Z 0
 #endif
+// the frame surface is bound through its RGBA8 view (the same bits as the R32 value: R in the low
+// byte), so hardware blending works on it (HW build); packUnorm4x8/unpackUnorm4x8 are exact.
+// Passes with a z surface also have a depth attachment that mirrors it: every pipeline writes
+// gl_FragDepth = ZD(the z value the pixel ends with) (the HW build tests against it).
+#define ZD(z) (float(z) * (1.0 / 4294967296.0))
 // Per batch the renderer builds a pipeline with these fixed (gs_vk.cpp draw_spec): the branches on
 // them fold away, which shortens the shader a lot (with rasterization order access the latency of
 // one fragment holds up the next one on the same pixel).
 // The general pipeline (draws while a batch's specialized one compiles in the background) uses
-// draw_general.frag, the 1.0.7-beta1 shader with the SC_DYN switch, unchanged. Two Adreno 840
+// draw_general.frag, the 1.0.7-beta1 shader with the SC_DYN switch. Two Adreno 840
 // driver bugs (2026-11-15) keep them apart: SC_DYN combined with the other constants in one shader
 // gave striped cutscenes at x2 in the specialized pipelines; a constant-free build of this file as
 // the general pipeline drew battle models as noise.
@@ -111,8 +116,8 @@ layout(set = 0, binding = 6) uniform usampler2D texm4;
 layout(set = 0, binding = 7) uniform usampler2D texm5;
 layout(set = 0, binding = 8) uniform usampler2D texm6;
 layout(set = 0, binding = 9) uniform sampler2D hdtex;   // HD replacement (sampler chosen per batch)
-layout(input_attachment_index = 0, set = 0, binding = 10) uniform usubpassInput fb_in;
-#if HAS_Z
+layout(input_attachment_index = 0, set = 0, binding = 10) uniform subpassInput fb_in;
+#if HAS_Z && !defined(HW)
 layout(input_attachment_index = 1, set = 0, binding = 11) uniform usubpassInput zb_in;
 #endif
 
@@ -122,7 +127,7 @@ layout(location = 2) noperspective in vec3 i_stq;
 layout(location = 3) noperspective in float i_z;
 layout(location = 4) noperspective in float i_fog;
 layout(location = 5) flat in uvec2 i_st;
-layout(location = 0) out uint fb_out;
+layout(location = 0) out vec4 fb_out;
 #if HAS_Z
 layout(location = 1) out uint zb_out;
 #endif
@@ -280,15 +285,31 @@ ivec4 sample_font(float u, float v, float lod) {
     return sharp;
 }
 
+bool atest_pass(uint ua) {
+    switch (ATST) {
+    case 0u: return false;
+    case 1u: return true;
+    case 2u: return ua < AREF;
+    case 3u: return ua <= AREF;
+    case 4u: return ua == AREF;
+    case 5u: return ua >= AREF;
+    case 6u: return ua > AREF;
+    default: return ua != AREF;
+    }
+}
+
 void main() {
     PST = i_st;
     ivec2 P = ivec2(gl_FragCoord.xy);
     int S = int(vp.z);
-    uint raw = subpassLoad(fb_in).x;
-    fb_out = raw;
+#ifndef HW
+    uint raw = packUnorm4x8(subpassLoad(fb_in));
+    fb_out = unpackUnorm4x8(raw);
 #if HAS_Z
     uint zraw = subpassLoad(zb_in).x;
     zb_out = zraw;
+    gl_FragDepth = ZD(zraw);
+#endif
 #endif
     ivec4 c = (IIP != 0u) ? ivec4(i_col) : ivec4(i_fcol);
     int r = c.x, g = c.y, b = c.z, a = c.w;
@@ -336,20 +357,33 @@ void main() {
         g = (g * fg + fgc * (255 - fg)) >> 8;
         b = (b * fg + fbc * (255 - fg)) >> 8;
     }
+#ifdef HW
+    // hardware path (gs_vk.cpp hw_config): blending, depth test and write masks are pipeline state.
+    // f12.x: 0 whole alpha test (fail = discard), 1 the passing part, 2 the failing part (own draw
+    // with its own masks); f12.y: 1 = blend factor As/128 in the output alpha (the written alpha
+    // then comes from the blend constant 128/255, see there)
+    if (ATE != 0u) {
+        bool ap = atest_pass(uint(a));
+        if (f12.x == 2u) { if (ap) discard; }
+        else if (!ap) discard;
+    }
+#if HAS_Z
+    {
+        uint zm = (ZFMT == 0u) ? 0xFFFFFFFFu : ((ZFMT == 1u) ? 0xFFFFFFu : 0xFFFFu);
+        float zf = i_z;
+        uint z = (zf >= 4294967295.0) ? 0xFFFFFFFFu : ((zf <= 0.0) ? 0u : uint(zf));
+        z = min(z, zm);
+        zb_out = z;
+        gl_FragDepth = ZD(z);
+    }
+#endif
+    r = clamp(r, 0, 255); g = clamp(g, 0, 255); b = clamp(b, 0, 255);
+    int oa = (int(a) & 0xFF) | int(FBA);
+    fb_out = vec4(float(r), float(g), float(b), (f12.y == 1u) ? float(a) * 255.0 / 128.0 : float(oa)) / 255.0;
+#else
     bool write_rgb = true, write_a = true, write_z = (ZMSK == 0u);
     if (ATE != 0u) {
-        uint ua = uint(a);
-        bool apass;
-        switch (ATST) {
-        case 0u: apass = false; break;
-        case 1u: apass = true; break;
-        case 2u: apass = ua < AREF; break;
-        case 3u: apass = ua <= AREF; break;
-        case 4u: apass = ua == AREF; break;
-        case 5u: apass = ua >= AREF; break;
-        case 6u: apass = ua > AREF; break;
-        default: apass = ua != AREF; break;
-        }
+        bool apass = atest_pass(uint(a));
         if (!apass) {
             if (AFAIL == 0u) discard;
             else if (AFAIL == 1u) write_z = false;
@@ -374,7 +408,10 @@ void main() {
             bool zpass = (ZTST == 0u) ? false : ((ZTST == 2u) ? (z >= dz) : (z > dz));
             if (!zpass) return;
         }
-        if (write_z) zb_out = (ZFMT == 1u) ? ((zraw & 0xFF000000u) | z) : ((ZFMT == 2u) ? ((zraw & 0xFFFF0000u) | z) : z);
+        if (write_z) {
+            zb_out = (ZFMT == 1u) ? ((zraw & 0xFF000000u) | z) : ((ZFMT == 2u) ? ((zraw & 0xFFFF0000u) | z) : z);
+            gl_FragDepth = ZD(zb_out);
+        }
     }
 #endif
     if (!write_rgb && !write_a) return;
@@ -408,9 +445,10 @@ void main() {
     if (FPSM == 2u) {
         uint c16 = ((col >> 3) & 0x1Fu) | (((col >> 11) & 0x1Fu) << 5) | (((col >> 19) & 0x1Fu) << 10) | ((col >> 16) & 0x8000u);
         uint m16 = ((mask >> 3) & 0x1Fu) | (((mask >> 11) & 0x1Fu) << 5) | (((mask >> 19) & 0x1Fu) << 10) | ((mask >> 16) & 0x8000u);
-        fb_out = (raw & (m16 | 0xFFFF0000u)) | (c16 & ~m16 & 0xFFFFu);
+        fb_out = unpackUnorm4x8((raw & (m16 | 0xFFFF0000u)) | (c16 & ~m16 & 0xFFFFu));
     } else {
         if (FPSM == 1u) mask |= 0xFF000000u;
-        fb_out = (raw & mask) | (col & ~mask);
+        fb_out = unpackUnorm4x8((raw & mask) | (col & ~mask));
     }
+#endif
 }

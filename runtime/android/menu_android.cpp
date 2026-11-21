@@ -58,6 +58,9 @@ const wchar_t* tra(const wchar_t* de) {
         {L"Disc wechseln (beim nächsten Start)", L"Change disc (at the next start)"},
         {L"Disc-Abbild neu wählen (beim nächsten Start)", L"Choose the disc image again (at the next start)"},
         {L"wählen", L"choose"},
+        {L"Touch-Steuerung nach 5 s ausblenden", L"Hide the touch controls after 5 s"},
+        {L"Kamera drehen durch Wischen: Tempo", L"Camera swipe speed"},
+        {L"Steuerkreuz anzeigen", L"Show the d-pad"},
         {L"Beim nächsten Start fragt die App nach dem Abbild.", L"The app asks for the image at the next start."},
         {L"Wirkt beim nächsten Start der App.", L"Takes effect at the next start of the app."},
         {L"Tippen: auswählen, nochmal tippen: ändern    außerhalb tippen: schließen",
@@ -115,6 +118,10 @@ void build_items() {
     g_items.push_back({L"Filme mit START überspringen", [&c] { return onoff(c.movie_skip); },
                        toggle(c.movie_skip, [&c] { g_ee_patch[3] = c.movie_skip; })});
     g_items.push_back({L"Kämpfe bei Gegnerkontakt", [&c] { return onoff(c.contact_battles); }, toggle(c.contact_battles)});
+    g_items.push_back({L"EXP aus Kämpfen", [&c] { return L"x" + std::to_wstring(c.exp_mult); },
+                       [&c](int dir) { c.exp_mult = (c.exp_mult - 1 + (dir < 0 ? 3 : 1)) % 4 + 1; }});
+    g_items.push_back({L"Gold aus Kämpfen", [&c] { return L"x" + std::to_wstring(c.gold_mult); },
+                       [&c](int dir) { c.gold_mult = (c.gold_mult - 1 + (dir < 0 ? 3 : 1)) % 4 + 1; }});
     g_items.push_back({L"Undub: japanische Stimmen (ab Neustart)", [&c] { return onoff(c.jp_voices); }, toggle(c.jp_voices)});
     g_items.push_back({nullptr, [] { return std::wstring(L"Audio"); }, nullptr, true});
     g_items.push_back({L"Lautstärke gesamt", [&c] { return std::to_wstring(c.volume) + L" %"; }, pct(c.volume, 5)});
@@ -124,6 +131,14 @@ void build_items() {
     g_items.push_back({L"Videos", [&c] { return std::to_wstring(c.vol_movie) + L" %"; }, pct(c.vol_movie, 5)});
     g_items.push_back({nullptr, [] { return std::wstring(L"Steuerung"); }, nullptr, true});
     g_items.push_back({L"Kamera umkehren (rechter Stick links/rechts)", [&c] { return onoff(c.camera_invert_x); }, toggle(c.camera_invert_x)});
+    g_items.push_back({L"Touch-Steuerung nach 5 s ausblenden", [&c] { return onoff(c.touch_autohide); },
+                       toggle(c.touch_autohide, [&c] { touch::set_autohide(c.touch_autohide); })});
+    g_items.push_back({L"Kamera drehen durch Wischen: Tempo", [&c] { return std::to_wstring(c.touch_cam_speed); }, [&c](int dir) {
+                           c.touch_cam_speed = clampi(c.touch_cam_speed + (dir ? dir : 1), 1, 15);
+                           touch::set_camera_speed(c.touch_cam_speed);
+                       }});
+    g_items.push_back({L"Steuerkreuz anzeigen", [&c] { return onoff(c.touch_dpad); },
+                       toggle(c.touch_dpad, [&c] { touch::set_dpad(c.touch_dpad); })});
     g_items.push_back({nullptr, [] { return std::wstring(L"System"); }, nullptr, true});
     g_items.push_back({L"Sprache (Language)", [&c] { return language_name(c.language); }, [&c](int dir) {
                            std::vector<std::string> l = languages();
@@ -176,6 +191,11 @@ void build_items() {
 }
 
 bool is_action(const std::wstring& v) { return v == L"speichern" || v == L"laden" || v == L"wählen"; }
+// a number setting (volume, speed, x2 ...): shown with arrows, a tap on an arrow changes it right away
+bool is_number(const std::wstring& v) {
+    size_t i = (!v.empty() && v[0] == L'x') ? 1 : 0;
+    return v.size() > i && v[i] >= L'0' && v[i] <= L'9';
+}
 
 std::string utf8(const std::wstring& w) {
     std::string s;
@@ -286,12 +306,12 @@ void render(int ow, int oh) {
         if (!v.empty()) {
             bool action = is_action(v);
             v = tra(v);
-            if (sel && it.change && !action) v = L"‹  " + v + L"  ›";
+            if (it.change && !action && (sel || is_number(it.value()))) v = L"‹  " + v + L"  ›";
             p.text(v, fs, W - pad, cy, sel ? VAL_SEL : VAL, true, val_x - row_h / 3);
         }
     }
     if (!g_note.empty()) p.text(tra(g_note), fs_small, pad, H - bottom + row_h * 3 / 4, NOTE);
-    bool pad_ui = !touch::visible();
+    bool pad_ui = touch::pad_active();
     p.text(tra(pad_ui ? L"↑↓ Auswahl    ←→ ändern    Kreuz: auswählen    Kreis: schließen"
                       : L"Tippen: auswählen, nochmal tippen: ändern    außerhalb tippen: schließen"),
            fs_small, pad, H - row_h * 3 / 4 - m, NOTE);
@@ -403,7 +423,12 @@ void menu_touch(int act, float x, float y) {
     if (r < 0 || r >= g.vis) return;
     int i = g_first + r;
     if (i >= (int)g_items.size() || g_items[i].header) return;
-    if (i != g_sel) {
+    std::wstring nv = g_items[i].value ? g_items[i].value() : L"";
+    if (is_number(nv) && px >= g.val_x) {
+        // number: the left half of the value lowers it, the right half raises it (also unselected)
+        g_sel = i;
+        invoke(px < (g.val_x + g.w) / 2 ? -1 : 1);
+    } else if (i != g_sel) {
         g_sel = i;
         if (g_disc_confirm) { g_disc_confirm = false; g_note.clear(); }
     } else {
