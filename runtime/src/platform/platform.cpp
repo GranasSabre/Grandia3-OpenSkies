@@ -1117,8 +1117,10 @@ void run_message_loop() {
             // --overlay-test=SEC: open the in-game menu, move around, save a window screenshot
             g_overlay_test_at = 0;
             overlay_set_open(true);
-            for (int k = 0; k < g_overlay_test_downs; k++) overlay_handle_key(VK_DOWN);
-            overlay_handle_key(VK_LEFT);
+            // N = 100 * tabs to the right + rows down; only N < 100 changes the item (left)
+            for (int k = 0; k < g_overlay_test_downs / 100; k++) overlay_handle_key('E');
+            for (int k = 0; k < g_overlay_test_downs % 100; k++) overlay_handle_key(VK_DOWN);
+            if (g_overlay_test_downs < 100) overlay_handle_key(VK_LEFT);
             g_overlay_shot_at = host_time_sec() + 1.0;
         }
         if (g_overlay_shot_at > 0 && host_time_sec() >= g_overlay_shot_at) {

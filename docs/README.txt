@@ -64,7 +64,7 @@ Steam Deck
 
 Keys
 ----
-F1 / Back+Start   settings menu (the game pauses; change values with left/right); PS button too
+F1 / Back+Start   settings menu (the game pauses; tabs with L1/R1 or Q/E, values with left/right); PS button too
 F3                60 fps on/off
 F4                sharpening on/off
 F5 / Back+R1      save a savestate (slot chosen in the F1 menu)

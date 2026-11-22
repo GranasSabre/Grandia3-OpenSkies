@@ -72,7 +72,7 @@ Steam Deck
 
 Tasten
 ------
-F1 / Back+Start   Einstellungsmenü (das Spiel pausiert); auch die PS-Taste
+F1 / Back+Start   Einstellungsmenü (das Spiel pausiert; Reiter mit L1/R1 oder Q/E); auch die PS-Taste
 F3                60 fps ein/aus
 F4                Nachschärfen ein/aus
 F5 / Back+R1      Savestate speichern (Slot im F1-Menü)
