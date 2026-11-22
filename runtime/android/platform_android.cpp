@@ -448,7 +448,9 @@ static bool overlay_update(Overlay& o, int ow, int oh, int pic_x0, int pic_w) {
 // GPU renderer picture (gs_vk.cpp, on the renderer thread): fw x fh RGBA8 image; px: a CPU copy of a
 // recent picture of the same size for the movie bar detection (or null)
 static int g_gpu_movie_top = -1, g_gpu_movie_bottom = -1;
+static std::atomic<double> g_gpu_present_t{-1};  // last picture of the GPU renderer (host time)
 bool present_gpu(VkImageView view, int fw, int fh, const u32* px) {
+    g_gpu_present_t = host_time_sec();
     static Overlay ovl;
     if (g_overlay_test_at > 0 && host_time_sec() >= g_overlay_test_at) {
         // --overlay-test=SEC[,N]: open the menu, N rows down, change that row to the left (tests)
@@ -498,7 +500,10 @@ static void present_thread() {
         {
             std::unique_lock<std::mutex> lk(g_frame_mutex);
             // (the open menu pauses the game: no new frames, but the CPU presentation must still redraw it)
-            bool menu = overlay_open() && !vkc::ready();
+            // (when the software renderer makes the pictures: no Vulkan at all, or a Vulkan driver that
+            // cannot run the GPU renderer, e.g. Adreno 730 without raster order access; issue #19)
+            bool gpu_renderer = g_gpu_present_t >= 0 && host_time_sec() - g_gpu_present_t < 1.0;
+            bool menu = overlay_open() && !gpu_renderer;
             g_frame_cv.wait_for(lk, std::chrono::milliseconds(menu ? 33 : 200), [] { return g_frame_new || g_quit.load(); });
             double now = host_time_sec();
             if (fps_t0 < 0 || !std::isfinite(fps_t0) || !std::isfinite(now)) fps_t0 = now;
@@ -515,6 +520,12 @@ static void present_thread() {
             } else if (!menu || frame.empty()) {
                 continue;
             }  // else: the last picture again with the menu on top
+        }
+        if (g_overlay_test_at > 0 && host_time_sec() >= g_overlay_test_at) {
+            // --overlay-test=SEC[,N] with the software renderer's frames: open the menu, N rows down (no change)
+            g_overlay_test_at = 0;
+            overlay_set_open(true);
+            for (int k = 0; k < g_overlay_test_downs; k++) menu_nav(1);
         }
         std::lock_guard<std::mutex> wl(g_win_mutex);
         if (!g_window || fw <= 0 || fh <= 0) continue;
@@ -586,12 +597,6 @@ static void present_thread() {
                 d[x0 + x] = 0xFF000000u | (rb & 0x00FF00FF) | (g & 0x0000FF00);
             }
             std::fill(d + x0 + dw, d + b.width, 0xFF000000u);
-        }
-        if (g_overlay_test_at > 0 && host_time_sec() >= g_overlay_test_at) {
-            // --overlay-test=SEC[,N] in the CPU presentation: open the menu, N rows down (no change)
-            g_overlay_test_at = 0;
-            overlay_set_open(true);
-            for (int k = 0; k < g_overlay_test_downs; k++) menu_nav(1);
         }
         // CPU presentation (no Vulkan): touch controls, menu and subtitles at buffer size, blended on top
         // (touch coordinates are window pixels: the real window size, not the buffer's)

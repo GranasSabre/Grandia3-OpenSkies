@@ -58,6 +58,7 @@ bool g_no_uav_overlap = true, g_gpu_timing = false, g_no_batch_join = false, g_f
 static bool g_enabled = false;
 static bool g_cfg_mips = true;    // use the game's mip levels
 static bool g_no_batch_join_barrier = false;  // test: GRANDIA_VK_NO_DRAW_BARRIER
+static bool g_ordered = true;  // raster order attachment access (else split_draws; GRANDIA_VK_NO_RASTER_ORDER simulates)
 static int S = 1;
 static u32* shadow = nullptr;
 static int g_last_ow = 0, g_last_oh = 0;
@@ -789,8 +790,7 @@ static VkRenderPass make_draw_rp(bool z) {
     VkAttachmentReference dref{2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sp{};
     sp.pDepthStencilAttachment = z ? &dref : nullptr;
-    static const bool no_ro = getenv("GRANDIA_VK_NO_RASTER_ORDER") != nullptr;  // test: cost of the ordering (wrong picture)
-    sp.flags = no_ro ? 0 : VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT;
+    sp.flags = g_ordered ? VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT : 0;
     sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sp.colorAttachmentCount = z ? 2 : 1;
     sp.pColorAttachments = refs;
@@ -892,7 +892,7 @@ static VkPipeline make_draw_pipe(bool z, const u32* spec = nullptr, u32 hw = 0) 
         }
     }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.flags = (hw || getenv("GRANDIA_VK_NO_RASTER_ORDER")) ? 0 : VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+    cb.flags = (hw || !g_ordered) ? 0 : VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
     cb.attachmentCount = z ? 2 : 1;
     cb.pAttachments = ba;
     VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
@@ -1147,8 +1147,13 @@ static void clear_img(Img& i) {
 
 bool init(int scale) {
     if (!vkc::init()) return false;
-    if (!vkc::raster_order() || !vkc::push_descriptors()) {
-        log_write(LOG_GS, "gpu: Vulkan lacks rasterization order attachment access or push descriptors, using the software renderer");
+    // without VK_EXT_rasterization_order_attachment_access (older Adreno drivers, e.g. Adreno 730 on the
+    // Snapdragon 8+ Gen 1): the hardware path needs no ordering; programmable batches are split into
+    // draws without overlapping triangles with a barrier between them (split_draws), so the picture stays right
+    g_ordered = vkc::raster_order() && !getenv("GRANDIA_VK_NO_RASTER_ORDER");
+    if (!g_ordered) log_write(LOG_GS, "gpu: no rasterization order attachment access: programmable batches split into non-overlapping draws");
+    if (!vkc::push_descriptors()) {
+        log_write(LOG_GS, "gpu: Vulkan lacks push descriptors, using the software renderer");
         platform::message(platform::config().language == "de"
                               ? L"Die Grafikeinheit dieses Handys kann den Grafik-Renderer nicht ausführen. Das Spiel läuft mit dem Software-Renderer und wird sehr langsam sein."
                               : L"This phone's graphics unit cannot run the GPU renderer. The game uses the software renderer and will be very slow.");
@@ -1804,6 +1809,15 @@ static void evict_textures() {
 // ===========================================================================
 // Batches (as gs_gpu.cpp)
 // ===========================================================================
+// the next draw of this pass reads what the previous one wrote (tile-local barrier)
+static void draw_barrier() {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+    vkCmdPipelineBarrier(g_main, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
 struct GV {
     float x, y, z;
     float r, g, b, a;
@@ -1816,6 +1830,60 @@ static_assert(sizeof(GV) == 68, "vertex layout");
 static const size_t VB_BYTES = 16 << 20;
 
 static std::vector<GV> g_verts;
+
+// Without raster order access the pixels of one draw run in any order: a batch that reads its target
+// (programmable path) is split into runs of triangles whose bounding boxes (8x8 cells of the native
+// surface) do not overlap. The two triangles of a quad (sprite, line, point; they share two corners)
+// count as one unit. Output: (first vertex, count) pairs in g_split.
+static std::vector<uint32_t> g_split;
+static u64 st_split_draws = 0;  // draws made by split_draws (stats line)
+static std::vector<uint32_t> g_cell_run, g_cell_unit;
+static uint32_t g_run_id = 0;
+static void split_draws(uint32_t nv, int sw, int sh) {
+    g_split.clear();
+    const int CS = 8;
+    int gw = (sw + CS - 1) / CS + 1, gh = (sh + CS - 1) / CS + 1;
+    if ((int)g_cell_run.size() < gw * gh) { g_cell_run.assign((size_t)gw * gh, 0); g_cell_unit.assign((size_t)gw * gh, 0); }
+    uint32_t start = 0, unit = 0;
+    if (++g_run_id == 0) { std::fill(g_cell_run.begin(), g_cell_run.end(), 0); g_run_id = 1; }
+    auto same = [](const GV& a, const GV& b) { return a.x == b.x && a.y == b.y; };
+    for (uint32_t t = 0; t + 2 < nv; t += 3) {
+        const GV* v = &g_verts[t];
+        if (t >= 3) {
+            const GV* u = &g_verts[t - 3];
+            int shared = 0;
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++) shared += same(v[i], u[j]);
+            if (shared < 2) unit++;  // else: second half of a quad, same unit
+        }
+        float x0 = std::min({v[0].x, v[1].x, v[2].x}), x1 = std::max({v[0].x, v[1].x, v[2].x});
+        float y0 = std::min({v[0].y, v[1].y, v[2].y}), y1 = std::max({v[0].y, v[1].y, v[2].y});
+        // covered samples lie in [x0, x1) x [y0, y1) (top-left fill rule); cells of that range
+        int cx0 = std::clamp((int)floorf(x0) / CS, 0, gw - 1), cx1 = std::clamp(((int)ceilf(x1) - 1) / CS, 0, gw - 1);
+        int cy0 = std::clamp((int)floorf(y0) / CS, 0, gh - 1), cy1 = std::clamp(((int)ceilf(y1) - 1) / CS, 0, gh - 1);
+        bool hit = false;
+        for (int cy = cy0; cy <= cy1 && !hit; cy++)
+            for (int cx = cx0; cx <= cx1; cx++) {
+                size_t c = (size_t)cy * gw + cx;
+                if (g_cell_run[c] == g_run_id && g_cell_unit[c] != unit) { hit = true; break; }
+            }
+        if (hit) {  // a new draw from this triangle on
+            g_split.push_back(start);
+            g_split.push_back(t - start);
+            start = t;
+            if (++g_run_id == 0) { std::fill(g_cell_run.begin(), g_cell_run.end(), 0); g_run_id = 1; }
+        }
+        for (int cy = cy0; cy <= cy1; cy++)
+            for (int cx = cx0; cx <= cx1; cx++) {
+                size_t c = (size_t)cy * gw + cx;
+                g_cell_run[c] = g_run_id;
+                g_cell_unit[c] = unit;
+            }
+    }
+    g_split.push_back(start);
+    g_split.push_back(nv - start);
+    st_split_draws += g_split.size() / 2;
+}
 static DrawState g_bds;
 static u32 g_bid = ~0u;
 static bool g_bvalid = false;
@@ -2309,20 +2377,24 @@ static void flush() {
             vkCmdSetBlendConstants(g_main, bc);
         }
         if (!platform::skip_active() && sc.extent.width && sc.extent.height) {
-            vkCmdDraw(g_main, (uint32_t)(bytes / sizeof(GV)), 1, 0, 0);
-            prof_draw();
+            uint32_t nv = (uint32_t)(bytes / sizeof(GV));
+            if (!g_ordered && !nhw && nv > 3) {
+                // no raster order: triangles of one draw must not share pixels (they read the target)
+                split_draws(nv, fs->w, fs->h);
+                for (size_t k = 0; k < g_split.size(); k += 2) {
+                    if (k) draw_barrier();
+                    vkCmdDraw(g_main, g_split[k + 1], 1, g_split[k], 0);
+                    prof_draw();
+                }
+            } else {
+                vkCmdDraw(g_main, nv, 1, 0, 0);
+                prof_draw();
+            }
         }
     }
     st_batches++;
     if (!g_no_uav_overlap) end_pass();  // test: --uav-overlap = a render pass per batch
-    else if (!g_no_batch_join_barrier) {
-        // the next draw of this pass reads what this one wrote (tile-local barrier)
-        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-        vkCmdPipelineBarrier(g_main, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                             VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
-    }
+    else if (!g_no_batch_join_barrier) draw_barrier();
 
     bool color_write = ds.fbmsk != 0xFFFFFFFFu;
     auto mark = [&](Surface* s) {
@@ -2874,6 +2946,9 @@ std::string stats() {
         size_t n = strlen(b);
         snprintf(b + n, sizeof(b) - n, ", hw batches %llu", (unsigned long long)(st_hw_batches - l_hw));
         l_hw = st_hw_batches;
+        static u64 l_split = 0;
+        if (!g_ordered) snprintf(b + strlen(b), sizeof(b) - strlen(b), ", split draws %llu", (unsigned long long)(st_split_draws - l_split));
+        l_split = st_split_draws;
     }
     static u64 l_rep = 0;
     if (st_tex_replaced != l_rep) {
