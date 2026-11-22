@@ -86,6 +86,52 @@ public class GrandiaActivity extends NativeActivity {
         return null;
     }
 
+    // the folder the system extracted our .so files to (libadrenotools loads its hook libraries from there)
+    public String nativeLibDir() {
+        return getApplicationInfo().nativeLibraryDir;
+    }
+
+    // a custom Vulkan driver package (zip with the driver .so and usually meta.json, e.g. Turnip) chosen
+    // in the file picker: unpacked into <baseDir>/<name>/ in the app's internal storage (drivers must not
+    // be loaded from shared storage); returns the name, null on failure
+    public String installDriver(String uri, String baseDir) {
+        String name = "driver";
+        try {
+            android.database.Cursor c = getContentResolver().query(Uri.parse(uri),
+                    new String[] {android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null);
+            if (c != null) {
+                if (c.moveToFirst() && c.getString(0) != null) name = c.getString(0);
+                c.close();
+            }
+        } catch (Exception e) {
+        }
+        if (name.toLowerCase().endsWith(".zip")) name = name.substring(0, name.length() - 4);
+        name = name.replaceAll("[^A-Za-z0-9._-]", "_");
+        java.io.File dir = new java.io.File(baseDir, name);
+        try {
+            dir.mkdirs();
+            java.io.InputStream in = getContentResolver().openInputStream(Uri.parse(uri));
+            java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(in);
+            java.util.zip.ZipEntry e;
+            byte[] buf = new byte[65536];
+            int files = 0;
+            while ((e = z.getNextEntry()) != null) {
+                if (e.isDirectory()) continue;
+                String n = new java.io.File(e.getName()).getName();  // flat: no paths from the zip
+                if (n.isEmpty()) continue;
+                java.io.FileOutputStream out = new java.io.FileOutputStream(new java.io.File(dir, n));
+                int r;
+                while ((r = z.read(buf)) > 0) out.write(buf, 0, r);
+                out.close();
+                files++;
+            }
+            z.close();
+            return files > 0 ? name : null;
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
     public void showMessage(final String text) {
         runOnUiThread(new Runnable() {
             public void run() {

@@ -147,6 +147,35 @@ std::string g3_content_path(const std::string& uri) {
     return "/proc/self/fd/" + std::to_string(it->second);
 }
 
+// a string returned by an activity method without arguments ("" on failure)
+static std::string call_string(const char* name) {
+    Jni j;
+    jmethodID m = j.env ? j.method(name, "()Ljava/lang/String;") : nullptr;
+    if (!m) return "";
+    jstring r = (jstring)j.env->CallObjectMethod(g3_activity->clazz, m);
+    if (j.failed() || !r) return "";
+    const char* c = j.env->GetStringUTFChars(r, nullptr);
+    std::string s = c ? c : "";
+    if (c) j.env->ReleaseStringUTFChars(r, c);
+    return s;
+}
+
+// the app's native library folder (getApplicationInfo().nativeLibraryDir; vk_dyn.cpp)
+std::string g3_native_lib_dir() { return call_string("nativeLibDir"); }
+
+// unpacks a driver zip (content:// URI from the picker) into base/<name>/; returns the name, "" on failure
+std::string g3_install_driver(const std::string& uri, const std::string& base) {
+    Jni j;
+    jmethodID m = j.env ? j.method("installDriver", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") : nullptr;
+    if (!m) return "";
+    jstring r = (jstring)j.env->CallObjectMethod(g3_activity->clazz, m, j.env->NewStringUTF(uri.c_str()), j.env->NewStringUTF(base.c_str()));
+    if (j.failed() || !r) return "";
+    const char* c = j.env->GetStringUTFChars(r, nullptr);
+    std::string s = c ? c : "";
+    if (c) j.env->ReleaseStringUTFChars(r, c);
+    return s;
+}
+
 // system file picker (blocks until the player chose a document or cancelled); "" when cancelled
 std::string g3_pick_document() {
     {

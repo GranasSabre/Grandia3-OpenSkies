@@ -88,7 +88,7 @@ def ninja_file(bdir):
     gen_flags = common + ' -w -Igenerated/main'
     cxx_flags = (common + ' -std=c++20 -DNOMINMAX -Wall -Wno-unused-variable -Wno-unused-function '
                  '-Wno-unused-but-set-global -Wno-unused-but-set-variable -Wno-unknown-pragmas '
-                 f'-Iruntime/src -I{bdir}/gen -include runtime/android/g3_compat.h'
+                 f'-Iruntime/src -I{bdir}/gen -Ithird_party/libadrenotools/include -include runtime/android/g3_compat.h'
                  + ' ' + os.environ.get('G3_RT_FLAGS', ''))  # e.g. -gline-tables-only for profiling
     clang = os.path.join(LLVM, 'clang.exe')
     lines = [
@@ -112,7 +112,7 @@ def ninja_file(bdir):
         '  description = AS $in',
         'rule link',
         f'  command = $cxx --target={TARGET} -shared -static-libstdc++ -Wl,-u,ANativeActivity_onCreate -Wl,--no-undefined '
-        '-o $out @$out.rsp -landroid -llog -laaudio -lvulkan -lm',
+        '-o $out @$out.rsp -landroid -llog -laaudio -lm -ldl',
         '  rspfile = $out.rsp',
         '  rspfile_content = $in',
         '  description = LINK $out',
@@ -163,11 +163,40 @@ def ninja_file(bdir):
     objs.append(f'{bdir}/android/fiber_arm64.o')
     lines.append(f'build {bdir}/android/glue.o: cc {glue}/android_native_app_glue.c')
     objs.append(f'{bdir}/android/glue.o')
+    # libadrenotools (custom GPU drivers such as Turnip, vk_dyn.cpp): its loader goes into libgrandia3.so,
+    # its hook libraries are .so files of their own next to it (loaded from the native library folder)
+    at = 'third_party/libadrenotools'
+    lines += [f'atflags = --target={TARGET} -O2 -fPIC -I{at}/include -I{at} -I{at}/lib/linkernsbypass -I{at}/src/hook',
+              'rule atcxx',
+              '  command = $cxx $atflags -std=c++20 -w -c $in -o $out',
+              '  description = CXX $in',
+              'rule atcc',
+              '  command = $cc $atflags -w -c $in -o $out',
+              '  description = CC $in',
+              'rule atso',
+              f'  command = $cxx --target={TARGET} -shared -static-libstdc++ -Wl,--no-undefined $ldx -o $out $in -L{bdir}/lib/arm64-v8a $libs -ldl -llog -landroid',
+              '  description = LINK $out']
+    def atobj(src, rule):
+        obj = f'{bdir}/at/' + os.path.basename(src).rsplit('.', 1)[0] + '.o'
+        lines.append(f'build {obj}: {rule} {at}/{src}')
+        return obj
+    ns = [atobj('lib/linkernsbypass/android_linker_ns.cpp', 'atcxx'), atobj('lib/linkernsbypass/elf_soname_patcher.cpp', 'atcxx')]
+    objs += [atobj('src/driver.cpp', 'atcxx'), atobj('src/bcenabler.cpp', 'atcxx')] + ns
+    libdir = f'{bdir}/lib/arm64-v8a'
+    hook_impl = f'{libdir}/libhook_impl.so'
+    lines.append(f'build {hook_impl}: atso {atobj("src/hook/hook_impl.cpp", "atcxx")} ' + ' '.join(ns))
+    hooks = [hook_impl]
+    for h in ('main_hook', 'file_redirect_hook', 'gsl_alloc_hook'):
+        out_so = f'{libdir}/lib{h}.so'
+        lines.append(f'build {out_so}: atso {atobj(f"src/hook/{h}.c", "atcc")} | {hook_impl}')
+        lines.append('  libs = -lhook_impl')
+        lines.append('  ldx = -Wl,-z,global')
+        hooks.append(out_so)
     lines.append('build rt: phony ' + ' '.join(o for o in objs if '/gen/' not in o))  # runtime only (quick checks)
     lines.append(f'build {bdir}/libgen.a: ar ' + ' '.join(objs_gen))
     so = f'{bdir}/lib/arm64-v8a/libgrandia3.so'
     lines.append(f'build {so}: link ' + ' '.join(objs) + f' {bdir}/libgen.a')
-    lines.append(f'default {so}')
+    lines.append(f'default {so} ' + ' '.join(hooks))
     return so, '\n'.join(lines) + '\n'
 
 
@@ -255,7 +284,8 @@ def pack_apk(bdir, so):
     with zipfile.ZipFile(base) as zi, zipfile.ZipFile(unaligned, 'w', zipfile.ZIP_DEFLATED) as zo:
         for item in zi.infolist():
             zo.writestr(item, zi.read(item.filename))
-        zo.write(os.path.join(ROOT, so), 'lib/arm64-v8a/libgrandia3.so')
+        for lib in sorted(glob.glob(os.path.join(ROOT, os.path.dirname(so), '*.so'))):  # libgrandia3.so + adrenotools hooks
+            zo.write(lib, 'lib/arm64-v8a/' + os.path.basename(lib))
         zo.write(build_dex(bdir), 'classes.dex')
         files = lang_files()
         h = hashlib.sha256()

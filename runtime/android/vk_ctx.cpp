@@ -1,7 +1,6 @@
 // Vulkan context and presentation (see vk_ctx.h).
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include "vk_ctx.h"
-#include <vulkan/vulkan.h>
 #include <algorithm>
 #include <cstring>
 #include <mutex>
@@ -343,8 +342,39 @@ bool create_swapchain() {
 }
 }  // namespace
 
+static bool init_device();
+
+static bool g_fallback = false;
 bool init() {
     if (g_dev) return true;
+    if (getenv("GRANDIA_NO_VULKAN")) return false;  // test: a phone without usable Vulkan (software renderer, CPU presentation)
+    std::string want = g3_gpu_driver_setting();
+    if (vkdyn::load(want) && init_device()) {
+        // which driver really answers (libadrenotools quietly falls back to the vendor driver when the
+        // custom one does not load): the driver id of VK_KHR_driver_properties (core in Vulkan 1.2)
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        if (vkGetPhysicalDeviceProperties2) vkGetPhysicalDeviceProperties2(g_pd, &p2);
+        log_write(LOG_MAIN, "vulkan: driver %s (id %d, %s %s)", vkdyn::driver_label().c_str(), (int)dp.driverID, dp.driverName, dp.driverInfo);
+        if (!want.empty() && dp.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY) {
+            log_write(LOG_MAIN, "vulkan: the custom driver '%s' did not load, the phone's own driver answers", want.c_str());
+            g_fallback = true;
+        }
+        return true;
+    }
+    if (want.empty()) return false;
+    // the custom driver failed: start again with the system driver (the half-made objects are dropped)
+    log_write(LOG_MAIN, "vulkan: custom driver '%s' failed, using the system driver", want.c_str());
+    g_dev = VK_NULL_HANDLE;
+    g_inst = VK_NULL_HANDLE;
+    g_pd = VK_NULL_HANDLE;
+    g_fallback = true;
+    return vkdyn::load("") && init_device();
+}
+bool driver_fallback() { return g_fallback; }
+
+static bool init_device() {
     const char* iext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "Grandia3";
@@ -354,6 +384,7 @@ bool init() {
     ici.enabledExtensionCount = 2;
     ici.ppEnabledExtensionNames = iext;
     if (vkCreateInstance(&ici, nullptr, &g_inst) != VK_SUCCESS) return false;
+    vkdyn::load_instance(g_inst);
     uint32_t n = 1;
     if (vkEnumeratePhysicalDevices(g_inst, &n, &g_pd) < 0 || n == 0) return false;
     vkGetPhysicalDeviceMemoryProperties(g_pd, &g_mem);

@@ -2,7 +2,7 @@
 // design depends on (ordered read-modify-write of the target pixels like Direct3D's rasterizer
 // ordered views: fragment shader interlock or rasterization-order attachment access).
 #include "common.h"
-#include <vulkan/vulkan.h>
+#include "vk_dyn.h"
 #include <string>
 #include <vector>
 
@@ -13,10 +13,11 @@ void vk_probe() {
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
     VkInstance inst = VK_NULL_HANDLE;
-    if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) {
+    if (!vkCreateInstance || vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) {
         log_write(LOG_MAIN, "vulkan: no instance");
         return;
     }
+    vkdyn::load_instance(inst);
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> devs(n);

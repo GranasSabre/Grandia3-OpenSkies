@@ -58,6 +58,7 @@ namespace platform {
 
 static Config g_cfg;
 static std::string g_cfg_path;
+static std::string g_gpu_driver;  // custom Vulkan driver folder under files/gpu_drivers ("" = system; vk_dyn.cpp)
 
 bool g_force_steam_deck = false;
 bool g_shots_final = false;
@@ -189,6 +190,7 @@ void load_config(const std::string& path) {
         else if (k == "disc") g_cfg.disc = iv == 2 ? 2 : 1;
         else if (k == "camera_invert_x") g_cfg.camera_invert_x = iv != 0;
         else if (k == "touch_autohide") g_cfg.touch_autohide = iv != 0;
+        else if (k == "gpu_driver") g_gpu_driver = v;
         else if (k == "touch_cam_speed") g_cfg.touch_cam_speed = std::clamp(iv, 1, 15);
         else if (k == "touch_dpad") g_cfg.touch_dpad = iv != 0;
         else if (k == "hud_fix") g_cfg.hud_fix = iv != 0;
@@ -203,6 +205,11 @@ void load_config(const std::string& path) {
     touch::set_camera_speed(g_cfg.touch_cam_speed);
     touch::set_dpad(g_cfg.touch_dpad);
 }
+
+}  // namespace platform
+std::string g3_gpu_driver_setting() { return platform::g_gpu_driver; }
+void g3_set_gpu_driver_setting(const std::string& name) { platform::g_gpu_driver = name; }
+namespace platform {
 
 void save_config() {
     FILE* f = fopen(g_cfg_path.c_str(), "w");
@@ -228,6 +235,8 @@ void save_config() {
     fprintf(f, "\n[Input]\ncamera_invert_x = %d\n", g_cfg.camera_invert_x);
     fprintf(f, "; 1 = the touch controls fade out after a few seconds without a touch (always hidden with a controller)\n");
     fprintf(f, "touch_autohide = %d\n", g_cfg.touch_autohide);
+    fprintf(f, "\n[GPU]\n; custom Vulkan driver (folder in files/gpu_drivers, e.g. Turnip); empty = the phone's own driver\ngpu_driver = %s\n",
+            g_gpu_driver.c_str());
     fprintf(f, "; camera swipe speed 1-15; 1 = d-pad in the touch controls\ntouch_cam_speed = %d\ntouch_dpad = %d\n", g_cfg.touch_cam_speed,
             g_cfg.touch_dpad);
     fclose(f);
@@ -249,6 +258,9 @@ void menu_nav(int k);
 void menu_touch(int act, float x, float y);
 bool menu_pixels(int ow, int oh, std::vector<u32>& out, int& w, int& h, int& x, int& y, u64& version);
 static std::atomic<float> g_ovl_sx{0.5f}, g_ovl_sy{0.5f};  // window pixels -> overlay pixels
+// the window's real size (touch coordinates): ANativeWindow_getWidth reports the buffer size once the
+// CPU presentation has set its own buffer geometry
+static std::atomic<int> g_real_w{0}, g_real_h{0};
 
 // ---------------------------------------------------------------------------
 // Video: the software renderer's frames, scaled into the window buffer
@@ -443,7 +455,7 @@ bool present_gpu(VkImageView view, int fw, int fh, const u32* px) {
         g_overlay_test_at = 0;
         overlay_set_open(true);
         for (int k = 0; k < g_overlay_test_downs; k++) menu_nav(1);
-        menu_nav(2);
+        if (g_overlay_test_downs > 0) menu_nav(2);  // (N = 0: only open it)
     }
     {
         std::lock_guard<std::mutex> lk(g_frame_mutex);
@@ -485,7 +497,9 @@ static void present_thread() {
     while (!g_quit) {
         {
             std::unique_lock<std::mutex> lk(g_frame_mutex);
-            g_frame_cv.wait_for(lk, std::chrono::milliseconds(200), [] { return g_frame_new || g_quit.load(); });
+            // (the open menu pauses the game: no new frames, but the CPU presentation must still redraw it)
+            bool menu = overlay_open() && !vkc::ready();
+            g_frame_cv.wait_for(lk, std::chrono::milliseconds(menu ? 33 : 200), [] { return g_frame_new || g_quit.load(); });
             double now = host_time_sec();
             if (fps_t0 < 0 || !std::isfinite(fps_t0) || !std::isfinite(now)) fps_t0 = now;
             else if (now - fps_t0 >= 5.0) {
@@ -493,11 +507,14 @@ static void present_thread() {
                 g_fps_count = 0;
                 fps_t0 = now;
             }
-            if (!g_frame_new) continue;
-            g_frame_new = false;
-            frame.swap(g_frame);
-            fw = g_frame_w;
-            fh = g_frame_h;
+            if (g_frame_new) {
+                g_frame_new = false;
+                frame.swap(g_frame);
+                fw = g_frame_w;
+                fh = g_frame_h;
+            } else if (!menu || frame.empty()) {
+                continue;
+            }  // else: the last picture again with the menu on top
         }
         std::lock_guard<std::mutex> wl(g_win_mutex);
         if (!g_window || fw <= 0 || fh <= 0) continue;
@@ -570,8 +587,32 @@ static void present_thread() {
             }
             std::fill(d + x0 + dw, d + b.width, 0xFF000000u);
         }
-        touch::layout(b.width, b.height, ww, wh);
-        touch::draw(dst, b.stride);
+        if (g_overlay_test_at > 0 && host_time_sec() >= g_overlay_test_at) {
+            // --overlay-test=SEC[,N] in the CPU presentation: open the menu, N rows down (no change)
+            g_overlay_test_at = 0;
+            overlay_set_open(true);
+            for (int k = 0; k < g_overlay_test_downs; k++) menu_nav(1);
+        }
+        // CPU presentation (no Vulkan): touch controls, menu and subtitles at buffer size, blended on top
+        // (touch coordinates are window pixels: the real window size, not the buffer's)
+        int rw = g_real_w > 0 ? g_real_w.load() : ww, rh = g_real_h > 0 ? g_real_h.load() : wh;
+        touch::layout(b.width, b.height, rw, rh);
+        g_ovl_sx = (float)b.width / rw;
+        g_ovl_sy = (float)b.height / rh;
+        overlay_update(ovl, b.width, b.height, x0, dw);
+        if ((int)ovl.px.size() >= b.width * b.height)
+            for (int y = 0; y < b.height; y++) {
+                u32* d = dst + (size_t)y * b.stride;
+                const u32* o = ovl.px.data() + (size_t)y * b.width;
+                for (int x = 0; x < b.width; x++) {
+                    u32 s = o[x], a = s >> 24;
+                    if (!a) continue;
+                    u32 na = 255 - a, dd = d[x];  // premultiplied "over"
+                    u32 r = (s & 0xFF) + ((dd & 0xFF) * na) / 255, g = ((s >> 8) & 0xFF) + (((dd >> 8) & 0xFF) * na) / 255;
+                    u32 bl = ((s >> 16) & 0xFF) + (((dd >> 16) & 0xFF) * na) / 255;
+                    d[x] = 0xFF000000u | std::min(255u, bl) << 16 | std::min(255u, g) << 8 | std::min(255u, r);
+                }
+            }
         ANativeWindow_unlockAndPost(g_window);
     }
 }
@@ -755,6 +796,8 @@ static int32_t menu_input(AInputEvent* e, int32_t type) {
         case AKEYCODE_DPAD_DOWN: platform::menu_nav(1); break;
         case AKEYCODE_DPAD_LEFT: platform::menu_nav(2); break;
         case AKEYCODE_DPAD_RIGHT: platform::menu_nav(3); break;
+        case AKEYCODE_BUTTON_L1: platform::menu_nav(6); break;   // previous tab
+        case AKEYCODE_BUTTON_R1: platform::menu_nav(7); break;   // next tab
         case AKEYCODE_BUTTON_A: case AKEYCODE_DPAD_CENTER: case AKEYCODE_ENTER: platform::menu_nav(4); break;
         case AKEYCODE_BUTTON_B: case AKEYCODE_BACK: case AKEYCODE_BUTTON_START: case AKEYCODE_BUTTON_MODE:
         case AKEYCODE_BUTTON_SELECT: case AKEYCODE_ESCAPE: platform::menu_nav(5); break;
@@ -969,7 +1012,11 @@ static void on_cmd(android_app* app, int32_t cmd) {
     case APP_CMD_INIT_WINDOW: {
         std::lock_guard<std::mutex> lk(g_win_mutex);
         g_window = app->window;
-        if (vkc::init() && !vkc::set_window(g_window)) log_write(LOG_MAIN, "vulkan: no swapchain, CPU presentation");
+        platform::g_real_w = ANativeWindow_getWidth(g_window);
+        platform::g_real_h = ANativeWindow_getHeight(g_window);
+        log_write(LOG_MAIN, "window %dx%d", platform::g_real_w.load(), platform::g_real_h.load());
+        if (getenv("GRANDIA_NO_VULKAN")) log_write(LOG_MAIN, "vulkan: off (test switch), CPU presentation");  // test: phones without Vulkan
+        else if (vkc::init() && !vkc::set_window(g_window)) log_write(LOG_MAIN, "vulkan: no swapchain, CPU presentation");
         g_win_cv.notify_all();
         break;
     }

@@ -3,11 +3,12 @@
 #pragma once
 #include "common.h"
 #include <android/native_window.h>
-#include <vulkan/vulkan.h>
+#include "vk_dyn.h"
 #include <mutex>
 
 namespace vkc {
-bool init();                         // instance and device (once; false: no usable Vulkan)
+bool init();                         // instance and device (once; false: no usable Vulkan); custom GPU driver first if chosen
+bool driver_fallback();              // the chosen custom driver failed, the system driver runs
 bool set_window(ANativeWindow* w);   // swapchain on the window (nullptr: release it)
 bool ready();                        // a swapchain exists
 // Present a picture: RGBA8 pixels (R in the low byte) w x h with row stride, its rows
