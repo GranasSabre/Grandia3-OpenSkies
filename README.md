@@ -108,6 +108,8 @@ The game writes `grandia3.log` next to itself. Please attach it when you report 
 [Issues](../../issues). Feedback on the subtitles (timing, wrong or missing lines) and the translations
 is welcome too.
 
+**Black screen, then the game closes (NVIDIA):** a forced *Antialiasing - Transparency* (supersampling) in the NVIDIA Control Panel crashes the graphics driver with this game. Set it to *Off* (or *Multisampling*) for `Grandia3.exe`, or reset the program settings for it. Thanks to GothicIII for finding this ([#20](../../issues/20)).
+
 ## License
 
 The code in this repository (the translation tools and the runtime) is under the MIT license - see
